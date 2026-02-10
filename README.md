@@ -119,13 +119,18 @@ See [USAGE.md](USAGE.md) for detailed usage instructions.
 
 MIT License
 
+## Documentation
+
+- [USAGE.md](USAGE.md) - How to build, run, and use the scheduler
+- [DESIGN.md](DESIGN.md) - Design philosophy and optimization decisions explained
+- [PROBLEM.md](PROBLEM.md) - Official problem description from Google
+- [README_CONTEST.md](README_CONTEST.md) - Original contest rules and information
+
 ## Contest Information
 
 - **Challenge**: Google MLSys 2026 Graph Scheduling Competition
 - **Track**: A (Systems Engineering)
 - **Deadline**: April 24, 2026
 
-For contest rules and problem description, see [PROBLEM.md](PROBLEM.md).
-For original contest README, see [README_CONTEST.md](README_CONTEST.md).
 
 
