@@ -1,0 +1,37 @@
+target/
+.idea/
+Cargo.lock
+
+# Test and build output files
+*.log
+*_output.txt
+*_results.txt
+*_test.txt
+bench_*.txt
+build_*.txt
+test_*.txt
+timing_*.txt
+results.txt
+result_new.txt
+run_output.txt
+
+# Git operation logs
+git_*.txt
+commit_*.txt
+push_*.txt
+final_summary.txt
+--verbose
+
+# Temporary solution files
+solution*.json
+sol_*.json
+result_*.json
+final_*.json
+num*.json
+
+# Keep benchmark inputs
+!benchmarks/*.json
+
+# Keep example problem
+!example_problem.json
+

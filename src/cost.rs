@@ -9,11 +9,13 @@
 //! - Dynamic Tiling: Search best granularity (128x128, 64x256, 256x64)
 //! - SRAM O(1): Resident tensors have zero memory cost
 //! - Parallel Search: Uses Rayon for multi-core tiling search
+//! - Telemetry: Detailed logging of tiling decisions
 
 use crate::models::{
     Granularity, Op, OpId, OpType, Problem,
     SubgraphLatency, Tensor, TensorId, TensorMeta, TotalLatency,
 };
+use crate::telemetry;
 use rayon::prelude::*;
 use std::collections::HashSet;
 
@@ -872,6 +874,76 @@ pub fn find_best_tiling(
             .filter_map(evaluate_candidate)
             .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
     };
+
+    // Log the decision if we found a valid result
+    if let Some((best_latency, ref best_gran)) = best_result {
+        // Log shape matching for the winning tile
+        if let Some(ref dominant) = dominant_output_size {
+            let tensor_ratio = if dominant.height > 0 {
+                dominant.width as f64 / dominant.height as f64
+            } else {
+                1.0
+            };
+            let tile_ratio = if best_gran.height > 0 {
+                best_gran.width as f64 / best_gran.height as f64
+            } else {
+                1.0
+            };
+            let match_bonus = compute_shape_match_bonus(best_gran.width, best_gran.height, dominant);
+
+            telemetry::log_shape_matching(
+                (dominant.width, dominant.height),
+                tensor_ratio,
+                (best_gran.width, best_gran.height),
+                tile_ratio,
+                match_bonus,
+            );
+        }
+
+        // Determine tiling reason
+        let tiling_reason = if best_gran.depth > 1 {
+            format!(
+                "Split-K={} reduces SRAM pressure by {:.0}%",
+                best_gran.depth,
+                (1.0 - 1.0 / best_gran.depth as f64) * 100.0
+            )
+        } else if best_gran.width != best_gran.height {
+            let ratio = best_gran.width as f64 / best_gran.height as f64;
+            if ratio > 1.5 {
+                "Wide tile matches row-major tensor layout".to_string()
+            } else if ratio < 0.67 {
+                "Tall tile matches column-major tensor layout".to_string()
+            } else {
+                "Balanced tile for mixed access patterns".to_string()
+            }
+        } else {
+            "Square tile for balanced compute/memory".to_string()
+        };
+
+        // Calculate latency improvement vs native
+        let native_gran = &problem.native_granularity;
+        let native_latency = evaluate_candidate(&(native_gran.width, native_gran.height, native_gran.depth))
+            .map(|(lat, _)| lat)
+            .unwrap_or(best_latency);
+
+        let improvement = if native_latency > 0.0 && native_latency != best_latency {
+            Some((native_latency - best_latency) / native_latency)
+        } else {
+            None
+        };
+
+        // Only log at trace level to avoid noise
+        if telemetry::is_trace() {
+            telemetry::log_tiling_decision(
+                0, // Subgraph ID not known here
+                ops,
+                best_gran,
+                &tiling_reason,
+                all_candidates.len(),
+                improvement,
+            );
+        }
+    }
 
     // Return the best granularity found, or fall back to native
     best_result
