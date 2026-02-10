@@ -9,10 +9,12 @@
 //! - `memory`: SRAM capacity management and working set computation
 //! - `cost`: Latency model for subgraph evaluation
 //! - `liveness`: Tensor liveness analysis for optimal SRAM allocation
+//! - `telemetry`: Engineering decision logging for transparency
 
 pub mod cost;
 pub mod liveness;
 pub mod memory;
 pub mod models;
 pub mod scheduler;
+pub mod telemetry;
 

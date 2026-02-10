@@ -4,6 +4,15 @@
 //!
 //! Optimized execution scheduler that minimizes latency while respecting
 //! Scratchpad (SRAM) memory constraints.
+//!
+//! ## Telemetry / Decision Logging
+//! 
+//! Enable verbose logging to see engineering decisions:
+//!   RUST_LOG=mlsys=info cargo run --release -- input.json output.json
+//!
+//! For detailed trace output:
+//!   RUST_LOG=mlsys=debug cargo run --release -- input.json output.json
+//!   RUST_LOG=mlsys=trace cargo run --release -- input.json output.json
 
 use anyhow::{Context, Result};
 use std::env;
@@ -14,8 +23,12 @@ use std::time::Instant;
 use mlsys::cost::compute_total_latency;
 use mlsys::models::{Problem, ProblemJson};
 use mlsys::scheduler::{optimize_schedule, schedule};
+use mlsys::telemetry;
 
 fn main() -> Result<()> {
+    // Initialize telemetry system (respects RUST_LOG environment variable)
+    telemetry::init();
+    
     let args: Vec<String> = env::args().collect();
 
     if args.len() != 3 {
@@ -28,8 +41,14 @@ fn main() -> Result<()> {
         eprintln!("  <input.json>   Problem definition file");
         eprintln!("  <output.json>  Output solution file");
         eprintln!();
+        eprintln!("Telemetry (Engineering Decision Logs):");
+        eprintln!("  RUST_LOG=mlsys=info  - Show key decisions");
+        eprintln!("  RUST_LOG=mlsys=debug - Show detailed analysis");
+        eprintln!("  RUST_LOG=mlsys=trace - Show all comparisons");
+        eprintln!();
         eprintln!("Example:");
         eprintln!("  {} example_problem.json solution.json", args[0]);
+        eprintln!("  RUST_LOG=mlsys=info {} input.json output.json", args[0]);
         std::process::exit(1);
     }
 

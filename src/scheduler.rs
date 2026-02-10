@@ -8,6 +8,7 @@
 //! 5. Dynamic Split-K - K dimension is split to fit perfectly in half SRAM
 //! 6. Micro-Kernel Grouping - Small ops are batched to fill native granularity
 //! 7. Parallel Processing - Uses Rayon for multi-core priority calculation
+//! 8. Telemetry - Detailed logging of engineering decisions
 
 use crate::cost::{compute_subgraph_latency, generate_snake_traversal, MemoryState};
 use crate::liveness::{
@@ -15,13 +16,14 @@ use crate::liveness::{
     find_micro_kernel_candidates, LivenessAnalysis, SramReservation,
 };
 use crate::memory::{
-    compute_available_retention_capacity,
+    compute_available_retention_capacity, compute_subgraph_working_set,
     find_fitting_granularity, find_split_k, validate_memory_fit,
 };
 use crate::models::{
     Granularity, GranularityOutput, OpId, OpType, Problem, Solution, Subgraph, SubgraphOutput,
     TensorId, TensorMeta,
 };
+use crate::telemetry;
 use petgraph::graph::{DiGraph, NodeIndex};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -1024,8 +1026,50 @@ pub fn schedule(problem: &Problem) -> Solution {
             &fused_ops, problem, &tensor_meta, &sram_reservation,
         );
 
+        // Calculate working set for telemetry
+        let working_set = compute_subgraph_working_set(&fused_ops, problem, &granularity, &tensor_meta);
+        let sram_utilization = (working_set.total_size as f64 / problem.fast_memory_capacity as f64) * 100.0;
+
+        // Log memory decision
+        telemetry::log_memory_decision(
+            &format!("Subgraph {}", subgraphs.len()),
+            working_set.total_size,
+            problem.fast_memory_capacity,
+            sram_utilization,
+            &format!("Granularity {}x{}x{}", granularity.width, granularity.height, granularity.depth),
+        );
+
+        // Log Split-K decision if applicable
+        if granularity.depth > 1 {
+            let sram_reduction = 100.0 * (1.0 - 1.0 / granularity.depth as f64);
+            let has_matmul = fused_ops.iter().any(|&op_id| problem.ops[op_id].is_matmul());
+            if has_matmul {
+                // Find the first MatMul for logging
+                if let Some(&matmul_op) = fused_ops.iter().find(|&&op_id| problem.ops[op_id].is_matmul()) {
+                    telemetry::log_split_k_decision(
+                        matmul_op,
+                        &problem.ops[matmul_op].op_type,
+                        granularity.depth,
+                        sram_reduction,
+                        sram_reduction * problem.fast_memory_capacity as f64 / 100.0,
+                        "Reduces working set to fit SRAM while enabling double-buffering",
+                    );
+                }
+            }
+        }
+
         // Generate traversal order
         let traversal_order = generate_traversal_order(&fused_ops, problem, &granularity);
+
+        // Log traversal decision
+        if let Some(ref order) = traversal_order {
+            telemetry::log_traversal_decision(
+                subgraphs.len(),
+                "Snake/Zig-zag",
+                order.len() as i64,
+                0.15, // Estimated reuse savings
+            );
+        }
 
         // Determine tensors to retain based on liveness analysis
         let remaining_ops: Vec<OpId> = state.unscheduled
@@ -1089,6 +1133,78 @@ pub fn schedule(problem: &Problem) -> Solution {
             &tensors_to_retain,
             traversal_order.is_some(),
         );
+
+        // === Telemetry: Log Fusion Decision ===
+        // Count intermediate tensors (produced and consumed within subgraph)
+        let fused_set: HashSet<OpId> = fused_ops.iter().copied().collect();
+        let intermediate_count = fused_ops.iter()
+            .flat_map(|&op_id| problem.ops[op_id].outputs.iter())
+            .filter(|&&out_id| {
+                let meta = &tensor_meta[out_id];
+                meta.consumers.iter().all(|c| fused_set.contains(c)) && !meta.is_output
+            })
+            .count();
+
+        // Estimate memory saved by fusion (intermediates don't go to DRAM)
+        let memory_saved: i64 = fused_ops.iter()
+            .flat_map(|&op_id| problem.ops[op_id].outputs.iter())
+            .filter(|&&out_id| {
+                let meta = &tensor_meta[out_id];
+                meta.consumers.iter().all(|c| fused_set.contains(c)) && !meta.is_output
+            })
+            .map(|&out_id| problem.tensors[out_id].size())
+            .sum();
+
+        // Determine fusion reason
+        let fusion_reason = if fused_ops.len() == 1 {
+            "Single op (no fusion opportunity)"
+        } else if intermediate_count > 0 {
+            "Intermediate tensors eliminated - avoiding DRAM round-trip"
+        } else {
+            "Ops share data dependencies - reducing memory traffic"
+        };
+
+        telemetry::log_fusion_decision(
+            subgraphs.len(),
+            &fused_ops,
+            seed_op,
+            fusion_reason,
+            intermediate_count,
+            memory_saved * 2, // *2 for read+write avoided
+        );
+
+        // === Telemetry: Log Retention Decision ===
+        let evicted_tensors: Vec<TensorId> = subgraph_outputs.iter()
+            .filter(|&&tid| !tensors_to_retain.contains(&tid))
+            .copied()
+            .collect();
+
+        let bytes_retained: i64 = tensors_to_retain.iter()
+            .map(|&tid| problem.tensors[tid].size())
+            .sum();
+
+        let future_reuse: usize = tensors_to_retain.iter()
+            .map(|&tid| state.remaining_consumers[tid])
+            .sum();
+
+        if !tensors_to_retain.is_empty() || !evicted_tensors.is_empty() {
+            let retention_reason = if tensors_to_retain.is_empty() {
+                "No tensors worth retaining (no future consumers)"
+            } else if bytes_retained as f64 > available_capacity as f64 * 0.8 {
+                "Retaining high-value tensors up to SRAM capacity"
+            } else {
+                "Retaining tensors with future reuse to avoid DRAM reload"
+            };
+
+            telemetry::log_retention_decision(
+                subgraphs.len(),
+                &tensors_to_retain,
+                &evicted_tensors,
+                retention_reason,
+                bytes_retained,
+                future_reuse,
+            );
+        }
 
         // Create subgraph
         let subgraph = Subgraph {
@@ -1160,6 +1276,43 @@ pub fn schedule(problem: &Problem) -> Solution {
             sg
         })
         .collect();
+
+    // === Telemetry: Final Summary ===
+    let total_ops = problem.ops.len();
+    let total_subgraphs = final_solution.len();
+    let total_latency: f64 = final_solution.iter().map(|sg| sg.subgraph_latency).sum();
+    let fusion_ratio = if total_subgraphs > 0 {
+        total_ops as f64 / total_subgraphs as f64
+    } else {
+        0.0
+    };
+    let split_k_usage = final_solution.iter()
+        .filter(|sg| sg.granularity.k.map(|k| k > 1).unwrap_or(false))
+        .count();
+    let retained_tensors: usize = final_solution.iter()
+        .map(|sg| sg.tensors_to_retain.len())
+        .sum();
+
+    telemetry::log_scheduling_summary(
+        total_ops,
+        total_subgraphs,
+        total_latency,
+        fusion_ratio,
+        split_k_usage,
+        retained_tensors,
+    );
+
+    // Log overall strategy
+    telemetry::log_strategy_decision(
+        &format!(
+            "Scheduled {} ops into {} subgraphs",
+            total_ops, total_subgraphs
+        ),
+        &format!(
+            "Fusion ratio={:.1}x, Split-K used in {} subgraphs, {} tensors retained across boundaries",
+            fusion_ratio, split_k_usage, retained_tensors
+        ),
+    );
 
     Solution {
         subgraphs: final_solution.iter().map(SubgraphOutput::from).collect(),
