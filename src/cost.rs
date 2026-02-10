@@ -179,7 +179,7 @@ pub fn compute_op_cost(
         let k = execution_granularity.depth.clamp(1, MAX_REASONABLE_SPLIT_K) as f64;
         // Logarithmic overhead: each doubling adds ~2% overhead
         // This models real hardware behavior where sync costs grow slowly
-        1.0 + 0.02 * (k as f64).ln().max(0.0)
+        1.0 + 0.02 * k.ln().max(0.0)
     } else {
         1.0
     };
@@ -423,7 +423,7 @@ pub fn compute_memory_transfer_cost(
 
             let meta = &tensor_meta[input_id];
             // External if producer is outside subgraph or graph input
-            let is_external = meta.producer.map_or(true, |p| !ops_set.contains(&p));
+            let is_external = meta.producer.is_none_or(|p| !ops_set.contains(&p));
 
             if is_external {
                 let tensor = &problem.tensors[input_id];
@@ -676,7 +676,7 @@ fn generate_shape_aware_candidates(
         if max_width >= 256 {
             let matched_h = (128.0 / dominant_ratio).max(16.0) as i64;
             let matched_h = (matched_h / 16) * 16; // Align to 16
-            if matched_h >= 16 && matched_h <= 256 {
+            if (16..=256).contains(&matched_h) {
                 candidates.push((256, matched_h.max(32)));
                 candidates.push((128, matched_h.max(16)));
             }
@@ -691,7 +691,7 @@ fn generate_shape_aware_candidates(
         if max_height >= 256 {
             let matched_w = (128.0 * dominant_ratio).max(16.0) as i64;
             let matched_w = (matched_w / 16) * 16; // Align to 16
-            if matched_w >= 16 && matched_w <= 256 {
+            if (16..=256).contains(&matched_w) {
                 candidates.push((matched_w.max(32), 256));
                 candidates.push((matched_w.max(16), 128));
             }
@@ -700,7 +700,7 @@ fn generate_shape_aware_candidates(
         // Moderately wide
         candidates.push((192, 96));
         candidates.push((160, 80));
-    } else if dominant_ratio < 0.83 && dominant_ratio >= 0.5 {
+    } else if (0.5..0.83).contains(&dominant_ratio) {
         // Moderately tall
         candidates.push((96, 192));
         candidates.push((80, 160));

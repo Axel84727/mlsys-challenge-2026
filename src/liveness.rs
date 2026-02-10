@@ -330,7 +330,7 @@ pub fn find_pointwise_chains(
                 // Check inputs
                 for &input_id in &op.inputs {
                     let meta = &tensor_meta[input_id];
-                    if meta.producer.map_or(true, |p| !chain_set.contains(&p)) {
+                    if meta.producer.is_none_or(|p| !chain_set.contains(&p)) {
                         external_inputs.insert(input_id);
                     }
                 }
