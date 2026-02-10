@@ -7,6 +7,7 @@
 //! 4. Aggressive Kernel Fusion - Pointwise chains are mathematically fused
 //! 5. Dynamic Split-K - K dimension is split to fit perfectly in half SRAM
 //! 6. Micro-Kernel Grouping - Small ops are batched to fill native granularity
+//! 7. Parallel Processing - Uses Rayon for multi-core priority calculation
 
 use crate::cost::{compute_subgraph_latency, generate_snake_traversal, MemoryState};
 use crate::liveness::{
@@ -22,6 +23,7 @@ use crate::models::{
     TensorId, TensorMeta,
 };
 use petgraph::graph::{DiGraph, NodeIndex};
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 
 // ============================================================================
@@ -307,10 +309,15 @@ impl<'a> SchedulerState<'a> {
 // Extreme Fusion Engine
 // ============================================================================
 
+/// Minimum candidates to justify parallel priority calculation
+const PARALLEL_PRIORITY_THRESHOLD: usize = 16;
+
 /// Aggressively fuse operations using global look-ahead.
 ///
 /// The key insight: Don't close a subgraph just because the "next" op doesn't fit.
 /// Instead, search the ENTIRE graph for ANY ready op that can be absorbed.
+///
+/// PARALLEL: Uses Rayon to calculate fusion priorities when there are enough candidates.
 fn extreme_fusion(
     seed_op: OpId,
     state: &SchedulerState,
@@ -329,29 +336,47 @@ fn extreme_fusion(
         // 1. Unscheduled
         // 2. Not already in our fused set
         // 3. Ready to execute (all dependencies satisfied by either scheduled ops OR our fused set)
-        let candidates: Vec<(OpId, i64)> = state.unscheduled
+
+        // First, collect eligible candidates (sequential, fast filtering)
+        let eligible_candidates: Vec<OpId> = state.unscheduled
             .iter()
             .copied()
             .filter(|&op_id| !fused_set.contains(&op_id))
             .filter(|&op_id| can_add_to_fusion(op_id, &fused_set, state))
-            .map(|op_id| {
-                let priority = state.calculate_fusion_priority(op_id, &fused_set, &subgraph_outputs);
-                (op_id, priority)
-            })
             .collect();
 
-        if candidates.is_empty() {
+        if eligible_candidates.is_empty() {
             break;
         }
 
+        // Calculate priorities - use parallel only for large candidate sets
+        let mut candidates: Vec<(OpId, i64)> = if eligible_candidates.len() >= PARALLEL_PRIORITY_THRESHOLD {
+            // PARALLEL: Calculate priorities for all candidates in parallel
+            eligible_candidates
+                .par_iter()
+                .map(|&op_id| {
+                    let priority = state.calculate_fusion_priority(op_id, &fused_set, &subgraph_outputs);
+                    (op_id, priority)
+                })
+                .collect()
+        } else {
+            // SEQUENTIAL: Avoid Rayon overhead for small candidate sets
+            eligible_candidates
+                .iter()
+                .map(|&op_id| {
+                    let priority = state.calculate_fusion_priority(op_id, &fused_set, &subgraph_outputs);
+                    (op_id, priority)
+                })
+                .collect()
+        };
+
         // Sort by priority (highest first)
-        let mut sorted_candidates = candidates;
-        sorted_candidates.sort_by(|a, b| b.1.cmp(&a.1));
+        candidates.sort_by(|a, b| b.1.cmp(&a.1));
 
         let mut added_any = false;
 
         // Try each candidate in priority order
-        for (candidate, priority) in sorted_candidates {
+        for (candidate, priority) in candidates {
             let mut test_ops: Vec<OpId> = fused_ops.clone();
             test_ops.push(candidate);
 
@@ -589,6 +614,8 @@ fn select_granularity_with_dynamic_split_k(
 }
 
 /// Analyze tensor residency with liveness-aware prioritization
+///
+/// PARALLEL: Uses Rayon to calculate retention scores in parallel for large candidate sets.
 fn analyze_tensor_residency_with_liveness(
     candidates: &[TensorId],
     remaining_ops: &[OpId],
@@ -597,51 +624,77 @@ fn analyze_tensor_residency_with_liveness(
     available_capacity: i64,
     liveness: &LivenessAnalysis,
 ) -> Vec<TensorId> {
-    if remaining_ops.is_empty() || available_capacity <= 0 {
+    if remaining_ops.is_empty() || available_capacity <= 0 || candidates.is_empty() {
         return Vec::new();
     }
 
     let remaining_set: HashSet<OpId> = remaining_ops.iter().copied().collect();
 
-    // Score candidates based on liveness analysis
-    let mut scored_candidates: Vec<(TensorId, i64, i64)> = Vec::new(); // (id, score, size)
+    // PARALLEL: Score all candidates in parallel for large sets
+    let mut scored_candidates: Vec<(TensorId, i64, i64)> = if candidates.len() >= 16 {
+        candidates
+            .par_iter()
+            .filter_map(|&tensor_id| {
+                let tensor_size = problem.tensors[tensor_id].size();
+                let meta = &tensor_meta[tensor_id];
+                let interval = &liveness.intervals[tensor_id];
 
-    for &tensor_id in candidates {
-        let tensor_size = problem.tensors[tensor_id].size();
-        let meta = &tensor_meta[tensor_id];
-        let interval = &liveness.intervals[tensor_id];
+                // Count remaining consumers
+                let remaining_consumers = meta
+                    .consumers
+                    .iter()
+                    .filter(|c| remaining_set.contains(c))
+                    .count();
 
-        // Count remaining consumers
-        let remaining_consumers = meta
-            .consumers
+                if remaining_consumers == 0 {
+                    return None;
+                }
+
+                // Calculate retention score
+                let mut score = 0i64;
+                score += tensor_size * remaining_consumers as i64;
+                score += interval.sram_priority / 10;
+                if liveness.guaranteed_sram.contains(&tensor_id) {
+                    score += 100_000;
+                }
+                let efficiency = (remaining_consumers as f64) / ((tensor_size as f64 / 1000.0) + 1.0);
+                score += (efficiency * 1000.0) as i64;
+
+                Some((tensor_id, score, tensor_size))
+            })
+            .collect()
+    } else {
+        // Sequential for small candidate sets (avoids Rayon overhead)
+        candidates
             .iter()
-            .filter(|c| remaining_set.contains(c))
-            .count();
+            .filter_map(|&tensor_id| {
+                let tensor_size = problem.tensors[tensor_id].size();
+                let meta = &tensor_meta[tensor_id];
+                let interval = &liveness.intervals[tensor_id];
 
-        if remaining_consumers == 0 {
-            continue;
-        }
+                let remaining_consumers = meta
+                    .consumers
+                    .iter()
+                    .filter(|c| remaining_set.contains(c))
+                    .count();
 
-        // Calculate retention score
-        let mut score = 0i64;
+                if remaining_consumers == 0 {
+                    return None;
+                }
 
-        // Base: bytes saved = size * remaining_consumers
-        score += tensor_size * remaining_consumers as i64;
+                let mut score = 0i64;
+                score += tensor_size * remaining_consumers as i64;
+                score += interval.sram_priority / 10;
+                if liveness.guaranteed_sram.contains(&tensor_id) {
+                    score += 100_000;
+                }
+                let efficiency = (remaining_consumers as f64) / ((tensor_size as f64 / 1000.0) + 1.0);
+                score += (efficiency * 1000.0) as i64;
 
-        // Liveness bonus: high-reuse tensors get priority
-        score += interval.sram_priority / 10;
-
-        // Guaranteed SRAM bonus
-        if liveness.guaranteed_sram.contains(&tensor_id) {
-            score += 100_000;
-        }
-
-        // Efficiency bonus: smaller tensors with high reuse
-        let efficiency = (remaining_consumers as f64) / ((tensor_size as f64 / 1000.0) + 1.0);
-        score += (efficiency * 1000.0) as i64;
-
-        scored_candidates.push((tensor_id, score, tensor_size));
-    }
+                Some((tensor_id, score, tensor_size))
+            })
+            .collect()
+    };
 
     // Sort by score (highest first)
     scored_candidates.sort_by(|a, b| b.1.cmp(&a.1));
@@ -689,52 +742,76 @@ fn generate_traversal_order(
 
 /// Select the best seed op for starting a new subgraph.
 /// Prioritizes ops that consume tensors currently in SRAM.
+///
+/// PARALLEL: Uses Rayon to calculate seed scores in parallel for large ready queues.
 fn select_best_seed(
     ready_ops: &[OpId],
     state: &SchedulerState,
 ) -> OpId {
-    let mut best_op = ready_ops[0];
-    let mut best_score: i64 = i64::MIN;
+    if ready_ops.len() == 1 {
+        return ready_ops[0];
+    }
 
-    for &op_id in ready_ops {
-        let op = &state.problem.ops[op_id];
-        let mut score: i64 = 0;
+    // For small ready queues, sequential is faster (avoids Rayon overhead)
+    if ready_ops.len() < 8 {
+        return select_best_seed_sequential(ready_ops, state);
+    }
 
-        // === SRAM Consumer Bonus ===
-        // Strongly prefer ops that consume SRAM-resident tensors
-        for &input_id in &op.inputs {
-            if state.sram_resident.contains(&input_id) {
-                score += 50_000;
+    // PARALLEL: Calculate scores for all ready ops in parallel
+    let best = ready_ops
+        .par_iter()
+        .map(|&op_id| {
+            let score = calculate_seed_score(op_id, state);
+            (op_id, score)
+        })
+        .max_by_key(|&(_, score)| score);
 
-                // Extra bonus if this tensor has few remaining consumers
-                // (we want to "finish" it and free SRAM)
-                let remaining = state.remaining_consumers[input_id];
-                if remaining <= 2 {
-                    score += 20_000;
-                }
+    best.map(|(op_id, _)| op_id).unwrap_or(ready_ops[0])
+}
+
+/// Calculate the seed score for an op (extracted for parallel use)
+#[inline]
+fn calculate_seed_score(op_id: OpId, state: &SchedulerState) -> i64 {
+    let op = &state.problem.ops[op_id];
+    let mut score: i64 = 0;
+
+    // === SRAM Consumer Bonus ===
+    for &input_id in &op.inputs {
+        if state.sram_resident.contains(&input_id) {
+            score += 50_000;
+            let remaining = state.remaining_consumers[input_id];
+            if remaining <= 2 {
+                score += 20_000;
             }
-        }
-
-        // === Op Type Preference ===
-        // MatMul ops are good seeds (they can pull in Pointwise)
-        if op.op_type == OpType::MatMul {
-            score += 10_000;
-        }
-
-        // === Output Consumer Count ===
-        // Prefer ops with many consumers (executing them unlocks more ops)
-        let consumer_count: usize = op.outputs.iter()
-            .map(|&out_id| state.tensor_meta[out_id].consumers.len())
-            .sum();
-        score += (consumer_count as i64) * 1_000;
-
-        if score > best_score {
-            best_score = score;
-            best_op = op_id;
         }
     }
 
-    best_op
+    // === Op Type Preference ===
+    if op.op_type == OpType::MatMul {
+        score += 10_000;
+    }
+
+    // === Output Consumer Count ===
+    let consumer_count: usize = op.outputs.iter()
+        .map(|&out_id| state.tensor_meta[out_id].consumers.len())
+        .sum();
+    score += (consumer_count as i64) * 1_000;
+
+    score
+}
+
+/// Sequential version for small ready queues (avoids Rayon overhead)
+#[inline]
+fn select_best_seed_sequential(
+    ready_ops: &[OpId],
+    state: &SchedulerState,
+) -> OpId {
+    ready_ops
+        .iter()
+        .map(|&op_id| (op_id, calculate_seed_score(op_id, state)))
+        .max_by_key(|&(_, score)| score)
+        .map(|(op_id, _)| op_id)
+        .unwrap_or(ready_ops[0])
 }
 
 // ============================================================================

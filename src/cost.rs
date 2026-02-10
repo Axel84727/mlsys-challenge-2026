@@ -8,11 +8,13 @@
 //! - Double Buffering: Overlapped memory transfers for SRAM-resident data
 //! - Dynamic Tiling: Search best granularity (128x128, 64x256, 256x64)
 //! - SRAM O(1): Resident tensors have zero memory cost
+//! - Parallel Search: Uses Rayon for multi-core tiling search
 
 use crate::models::{
     Granularity, Op, OpId, OpType, Problem,
     SubgraphLatency, Tensor, TensorId, TensorMeta, TotalLatency,
 };
+use rayon::prelude::*;
 use std::collections::HashSet;
 
 // ============================================================================
@@ -38,6 +40,96 @@ pub const FULL_OVERLAP_THRESHOLD: f64 = 1.0;
 pub const MAX_REASONABLE_SPLIT_K: i64 = 64;
 
 // ============================================================================
+// Register Tiling (Micro-Block Optimization)
+// ============================================================================
+
+/// Optimal micro-block size for register tiling (8x8 is common for most accelerators)
+/// This is the size that fits in register files for maximum data reuse
+pub const REGISTER_TILE_WIDTH: i64 = 8;
+pub const REGISTER_TILE_HEIGHT: i64 = 8;
+
+/// Maximum intra-tile reuse bonus (10-15% latency reduction as specified)
+/// This represents the savings from keeping data in registers vs SRAM reads
+pub const MAX_REGISTER_REUSE_BONUS: f64 = 0.15;
+
+/// Minimum tile size to benefit from register tiling
+/// Tiles smaller than 2x2 micro-blocks don't benefit from this optimization
+pub const MIN_TILE_FOR_REGISTER_TILING: i64 = REGISTER_TILE_WIDTH * 2;
+
+/// Calculate the intra-tile reuse factor for register tiling.
+///
+/// When a SRAM tile (e.g., 128x128) can be processed as micro-blocks (e.g., 8x8)
+/// that fit in registers, we avoid repeated SRAM reads within the tile processing.
+///
+/// Key insight: For MatMul C[m,n] = A[m,k] @ B[k,n], register blocking means:
+/// - Load micro-block of A into registers (8x8)
+/// - Load micro-block of B into registers (8x8)
+/// - Compute partial result in accumulator registers
+/// - Reuse A across multiple B blocks (row reuse)
+/// - Reuse B across multiple A blocks (column reuse)
+///
+/// The reuse factor depends on how many micro-blocks fit in the tile:
+/// - More micro-blocks = more reuse opportunities = lower effective cost
+///
+/// Returns a factor in range [1.0 - MAX_REGISTER_REUSE_BONUS, 1.0]
+/// where lower values indicate better register utilization.
+pub fn compute_register_tiling_factor(
+    tile_width: i64,
+    tile_height: i64,
+    op_type: &OpType,
+) -> f64 {
+    // Only MatMul benefits significantly from register tiling
+    // Pointwise ops have simpler access patterns with less reuse opportunity
+    if *op_type != OpType::MatMul {
+        // Pointwise gets a smaller bonus (5% max)
+        let pw_micro_blocks_w = (tile_width / REGISTER_TILE_WIDTH).max(1);
+        let pw_micro_blocks_h = (tile_height / REGISTER_TILE_HEIGHT).max(1);
+        let pw_total_micro_blocks = pw_micro_blocks_w * pw_micro_blocks_h;
+
+        if pw_total_micro_blocks >= 4 {
+            // Modest bonus for pointwise with good register blocking
+            return 1.0 - 0.05 * (1.0 - 1.0 / (pw_total_micro_blocks as f64).sqrt());
+        }
+        return 1.0;
+    }
+
+    // For tiles too small to benefit from register blocking
+    if tile_width < MIN_TILE_FOR_REGISTER_TILING || tile_height < MIN_TILE_FOR_REGISTER_TILING {
+        return 1.0;
+    }
+
+    // Calculate micro-blocks per dimension
+    let micro_blocks_w = (tile_width / REGISTER_TILE_WIDTH).max(1);
+    let micro_blocks_h = (tile_height / REGISTER_TILE_HEIGHT).max(1);
+    let _total_micro_blocks = micro_blocks_w * micro_blocks_h;
+
+    // Register reuse model for MatMul:
+    // In a perfectly blocked MatMul, each micro-block of A is reused across
+    // micro_blocks_w columns of B, and each micro-block of B is reused across
+    // micro_blocks_h rows of A.
+    //
+    // Reuse factor = (micro_blocks_w + micro_blocks_h) / 2
+    // Higher reuse = fewer SRAM reads = lower effective compute latency
+    let reuse_factor = ((micro_blocks_w + micro_blocks_h) as f64) / 2.0;
+
+    // Convert reuse to latency reduction
+    // More micro-blocks = more reuse = bigger bonus
+    // The bonus saturates as we can't get more than MAX_REGISTER_REUSE_BONUS
+    //
+    // Formula: bonus increases logarithmically with reuse factor
+    // At reuse_factor=2: ~5% bonus
+    // At reuse_factor=8: ~10% bonus
+    // At reuse_factor=16+: ~15% bonus (saturated)
+    let raw_bonus = MAX_REGISTER_REUSE_BONUS * (reuse_factor.ln() / 4.0_f64.ln()).min(1.0);
+
+    // Sanity bounds
+    let clamped_bonus = raw_bonus.clamp(0.0, MAX_REGISTER_REUSE_BONUS);
+
+    // Return factor (1.0 - bonus means lower cost)
+    1.0 - clamped_bonus
+}
+
+// ============================================================================
 // Compute Cost Calculation
 // ============================================================================
 
@@ -46,6 +138,7 @@ pub const MAX_REASONABLE_SPLIT_K: i64 = 64;
 /// GENERIC MODEL that handles ANY granularity configuration:
 /// - If granularity is smaller than native, there's inefficiency penalty
 /// - If using Split-K (depth > 1), overhead scales logarithmically with K
+/// - Register Tiling: micro-block optimization reduces SRAM reads (10-15% savings)
 /// - Handles edge cases safely (zero dimensions, huge K values, etc.)
 pub fn compute_op_cost(
     op: &Op,
@@ -89,7 +182,16 @@ pub fn compute_op_cost(
         1.0
     };
 
-    base_cost * num_spatial_tiles * inefficiency * split_k_factor
+    // Register Tiling factor - micro-block optimization for intra-tile reuse
+    // Larger tiles can be subdivided into register-sized blocks (8x8)
+    // reducing SRAM read traffic during computation
+    let register_tiling_factor = compute_register_tiling_factor(
+        execution_granularity.width,
+        execution_granularity.height,
+        &op.op_type,
+    );
+
+    base_cost * num_spatial_tiles * inefficiency * split_k_factor * register_tiling_factor
 }
 
 /// Calculate compute cost for an op (wrapper that supports input tensors context)
@@ -471,11 +573,11 @@ pub fn estimate_snake_savings(
 }
 
 // ============================================================================
-// Dynamic Tiling Search
+// Dynamic Tiling Search with Shape-Aware Asymmetric Tiles
 // ============================================================================
 
-/// Candidate granularity configurations for dynamic search.
-/// We evaluate these and pick the one with lowest latency.
+/// Base candidate granularity configurations for dynamic search.
+/// These are the standard options that work well for most cases.
 pub const TILING_CANDIDATES: [(i64, i64); 5] = [
     (128, 128),  // Square tiles - balanced
     (64, 256),   // Wide tiles - good for row-major access
@@ -484,11 +586,196 @@ pub const TILING_CANDIDATES: [(i64, i64); 5] = [
     (128, 64),   // Smaller tall
 ];
 
+/// Extended asymmetric tile candidates for "skinny" matrices.
+/// Many real-world MatMuls have extreme aspect ratios (e.g., 4096×128 or 128×4096).
+/// Square tiles waste bandwidth on these; shape-matched tiles are much more efficient.
+pub const ASYMMETRIC_TILING_CANDIDATES: [(i64, i64); 8] = [
+    (512, 32),   // Very wide - for matrices with many columns, few rows
+    (32, 512),   // Very tall - for matrices with many rows, few columns
+    (256, 32),   // Wide strip
+    (32, 256),   // Tall strip
+    (256, 128),  // Moderately wide
+    (128, 256),  // Moderately tall
+    (64, 64),    // Small square (fallback for memory-constrained cases)
+    (32, 128),   // Narrow tall
+];
+
+/// Compute the aspect ratio of a tensor (width / height).
+/// Returns a value > 1 for wide tensors, < 1 for tall tensors.
+#[inline]
+fn tensor_aspect_ratio(tensor: &Tensor) -> f64 {
+    if tensor.height <= 0 {
+        return 1.0;
+    }
+    tensor.width as f64 / tensor.height as f64
+}
+
+/// Generate shape-aware tiling candidates based on the dominant output tensor shape.
+///
+/// Key insight: If the output tensor is 4096×128 (wide), a 128×128 tile wastes
+/// bandwidth because we're loading 128 rows when we only need to process a strip.
+/// A 256×64 tile would be much more efficient for this shape.
+///
+/// The algorithm:
+/// 1. Analyze the dominant output tensor's aspect ratio
+/// 2. Generate candidates that match the tensor's shape
+/// 3. Include both shape-matched and standard candidates for comparison
+fn generate_shape_aware_candidates(
+    ops: &[OpId],
+    problem: &Problem,
+) -> Vec<(i64, i64)> {
+    let mut candidates: Vec<(i64, i64)> = Vec::with_capacity(20);
+
+    // Always include base candidates
+    candidates.extend_from_slice(&TILING_CANDIDATES);
+
+    // Analyze output tensor shapes to find the dominant aspect ratio
+    let mut _total_wide_area: i64 = 0;  // Area of tensors with aspect ratio > 1.5
+    let mut _total_tall_area: i64 = 0;  // Area of tensors with aspect ratio < 0.67
+    let mut max_width: i64 = 0;
+    let mut max_height: i64 = 0;
+    let mut dominant_ratio: f64 = 1.0;
+    let mut largest_output_size: i64 = 0;
+
+    for &op_id in ops {
+        let op = &problem.ops[op_id];
+        for &output_id in &op.outputs {
+            let tensor = &problem.tensors[output_id];
+            let size = tensor.size();
+            let ratio = tensor_aspect_ratio(tensor);
+
+            max_width = max_width.max(tensor.width);
+            max_height = max_height.max(tensor.height);
+
+            if size > largest_output_size {
+                largest_output_size = size;
+                dominant_ratio = ratio;
+            }
+
+            if ratio > 1.5 {
+                _total_wide_area += size;
+            } else if ratio < 0.67 {
+                _total_tall_area += size;
+            }
+        }
+    }
+
+    // Add extended asymmetric candidates
+    candidates.extend_from_slice(&ASYMMETRIC_TILING_CANDIDATES);
+
+    // Generate shape-matched candidates based on dominant ratio
+    if dominant_ratio > 2.0 {
+        // Very wide tensors - prioritize wide tiles
+        candidates.push((256, 32));
+        candidates.push((512, 32));
+        candidates.push((256, 64));
+        candidates.push((384, 48));
+        // Also try tiles that match the exact ratio
+        if max_width >= 256 {
+            let matched_h = (128.0 / dominant_ratio).max(16.0) as i64;
+            let matched_h = (matched_h / 16) * 16; // Align to 16
+            if matched_h >= 16 && matched_h <= 256 {
+                candidates.push((256, matched_h.max(32)));
+                candidates.push((128, matched_h.max(16)));
+            }
+        }
+    } else if dominant_ratio < 0.5 {
+        // Very tall tensors - prioritize tall tiles
+        candidates.push((32, 256));
+        candidates.push((32, 512));
+        candidates.push((64, 256));
+        candidates.push((48, 384));
+        // Also try tiles that match the exact ratio
+        if max_height >= 256 {
+            let matched_w = (128.0 * dominant_ratio).max(16.0) as i64;
+            let matched_w = (matched_w / 16) * 16; // Align to 16
+            if matched_w >= 16 && matched_w <= 256 {
+                candidates.push((matched_w.max(32), 256));
+                candidates.push((matched_w.max(16), 128));
+            }
+        }
+    } else if dominant_ratio > 1.2 && dominant_ratio <= 2.0 {
+        // Moderately wide
+        candidates.push((192, 96));
+        candidates.push((160, 80));
+    } else if dominant_ratio < 0.83 && dominant_ratio >= 0.5 {
+        // Moderately tall
+        candidates.push((96, 192));
+        candidates.push((80, 160));
+    }
+
+    // For MatMul-heavy workloads, add some specialized candidates
+    // based on common matrix shapes in ML (powers of 2, multiples of 64)
+    let has_large_matmul = ops.iter().any(|&op_id| {
+        let op = &problem.ops[op_id];
+        op.is_matmul() && op.outputs.iter().any(|&out_id| {
+            problem.tensors[out_id].size() > 16384 // > 128x128
+        })
+    });
+
+    if has_large_matmul {
+        // Common ML tile sizes
+        candidates.push((64, 64));
+        candidates.push((96, 96));
+        candidates.push((192, 64));
+        candidates.push((64, 192));
+    }
+
+    // Remove duplicates and invalid candidates
+    candidates.sort();
+    candidates.dedup();
+    candidates.retain(|&(w, h)| w >= 16 && h >= 16 && w <= 1024 && h <= 1024);
+
+    candidates
+}
+
+/// Calculate a shape-matching bonus for a tile configuration.
+///
+/// Returns a factor < 1.0 if the tile shape matches the tensor shape well,
+/// meaning lower effective cost. Factor of 1.0 means no bonus.
+fn compute_shape_match_bonus(
+    tile_width: i64,
+    tile_height: i64,
+    tensor: &Tensor,
+) -> f64 {
+    let tensor_ratio = tensor_aspect_ratio(tensor);
+    let tile_ratio = if tile_height > 0 {
+        tile_width as f64 / tile_height as f64
+    } else {
+        1.0
+    };
+
+    // Calculate how well the tile ratio matches the tensor ratio
+    // Perfect match = ratio of 1.0, mismatch = higher ratio
+    let ratio_match = if tensor_ratio > tile_ratio {
+        tensor_ratio / tile_ratio
+    } else {
+        tile_ratio / tensor_ratio
+    };
+
+    // Convert to bonus: perfect match (1.0) = 10% bonus, no match (>4) = no bonus
+    if ratio_match <= 1.2 {
+        0.90  // Excellent match: 10% bonus
+    } else if ratio_match <= 1.5 {
+        0.95  // Good match: 5% bonus
+    } else if ratio_match <= 2.0 {
+        0.98  // Decent match: 2% bonus
+    } else {
+        1.0   // Poor match: no bonus
+    }
+}
+
 /// Dynamic Tiling Search: Evaluate multiple granularity configurations
 /// and return the one that gives the lowest estimated latency.
 ///
 /// This is a mini search loop that quickly compares different tile shapes
 /// to find the optimal configuration for a specific subgraph.
+///
+/// NEW: Shape-Aware Search + Parallel Evaluation
+/// - Analyzes output tensor shapes to understand the workload
+/// - Generates shape-matched tile candidates (e.g., 256×64 for wide matrices)
+/// - Applies a shape-matching bonus to favor tiles that match the data layout
+/// - Uses Rayon for parallel evaluation of all candidates across CPU cores
 pub fn find_best_tiling(
     ops: &[OpId],
     problem: &Problem,
@@ -500,59 +787,96 @@ pub fn find_best_tiling(
         return problem.native_granularity.clone();
     }
 
-    let mut best_granularity = problem.native_granularity.clone();
-    let mut best_latency = f64::MAX;
-
     // Check if we have MatMul ops (need to consider Split-K)
     let has_matmul = ops.iter().any(|&op_id| problem.ops[op_id].is_matmul());
 
-    // Split-K values to try - MAX 4 for performance
+    // Split-K values to try
     let split_k_values: Vec<i64> = if has_matmul {
         vec![1, 2, 4]
     } else {
         vec![1]
     };
 
-    // Evaluate each candidate tiling configuration
-    for &(w, h) in &TILING_CANDIDATES {
-        for &k in &split_k_values {
-            let candidate = Granularity::new(w, h, k);
+    // Generate shape-aware candidates based on the actual tensor shapes
+    let tiling_candidates = generate_shape_aware_candidates(ops, problem);
 
-            // Check if it fits in memory
-            let ws = crate::memory::compute_subgraph_working_set(ops, problem, &candidate, tensor_meta);
-            if !ws.fits_in(problem.fast_memory_capacity) {
-                continue;
-            }
+    // Find the dominant output tensor for shape-matching bonus
+    let dominant_output_size = ops.iter()
+        .flat_map(|&op_id| problem.ops[op_id].outputs.iter())
+        .map(|&out_id| &problem.tensors[out_id])
+        .max_by_key(|t| t.size())
+        .cloned();
 
-            // Calculate latency for this configuration
-            let compute_cost = compute_subgraph_compute_cost(ops, problem, &candidate);
-            let memory_cost = compute_memory_transfer_cost(
-                ops, problem, &candidate, tensor_meta, memory_state, tensors_to_retain,
-            );
+    // Pre-compute snake factor data (first output tensor)
+    let snake_tensor = if !ops.is_empty() {
+        let first_op = &problem.ops[ops[0]];
+        first_op.outputs.first().map(|&out_id| problem.tensors[out_id].clone())
+    } else {
+        None
+    };
 
-            // Estimate snake traversal benefit
-            let snake_factor = if !ops.is_empty() {
-                let first_op = &problem.ops[ops[0]];
-                if let Some(&out_id) = first_op.outputs.first() {
-                    estimate_snake_savings(&problem.tensors[out_id], &candidate)
-                } else {
-                    1.0
-                }
-            } else {
-                1.0
-            };
+    // Generate all (w, h, k) combinations to evaluate
+    let all_candidates: Vec<(i64, i64, i64)> = tiling_candidates
+        .iter()
+        .flat_map(|&(w, h)| split_k_values.iter().map(move |&k| (w, h, k)))
+        .collect();
 
-            let adjusted_memory_cost = memory_cost * snake_factor;
-            let latency = compute_cost.max(adjusted_memory_cost) + SUBGRAPH_SETUP_PENALTY;
+    // Threshold for parallel evaluation: only use Rayon when we have enough work
+    // to overcome the thread pool overhead (~50+ candidates)
+    const PARALLEL_THRESHOLD: usize = 50;
 
-            if latency < best_latency {
-                best_latency = latency;
-                best_granularity = candidate;
-            }
+    let evaluate_candidate = |&(w, h, k): &(i64, i64, i64)| -> Option<(f64, Granularity)> {
+        let candidate = Granularity::new(w, h, k);
+
+        // Check if it fits in memory
+        let ws = crate::memory::compute_subgraph_working_set(ops, problem, &candidate, tensor_meta);
+        if !ws.fits_in(problem.fast_memory_capacity) {
+            return None;
         }
-    }
 
-    best_granularity
+        // Calculate latency for this configuration
+        let compute_cost = compute_subgraph_compute_cost(ops, problem, &candidate);
+        let memory_cost = compute_memory_transfer_cost(
+            ops, problem, &candidate, tensor_meta, memory_state, tensors_to_retain,
+        );
+
+        // Estimate snake traversal benefit
+        let snake_factor = snake_tensor
+            .as_ref()
+            .map(|t| estimate_snake_savings(t, &candidate))
+            .unwrap_or(1.0);
+
+        // Apply shape-matching bonus if we have a dominant output tensor
+        let shape_bonus = dominant_output_size
+            .as_ref()
+            .map(|t| compute_shape_match_bonus(w, h, t))
+            .unwrap_or(1.0);
+
+        let adjusted_memory_cost = memory_cost * snake_factor * shape_bonus;
+        let latency = compute_cost.max(adjusted_memory_cost) + SUBGRAPH_SETUP_PENALTY;
+
+        Some((latency, candidate))
+    };
+
+    // Choose parallel or sequential based on workload size
+    let best_result = if all_candidates.len() >= PARALLEL_THRESHOLD {
+        // PARALLEL: Use Rayon for large candidate sets
+        all_candidates
+            .par_iter()
+            .filter_map(evaluate_candidate)
+            .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+    } else {
+        // SEQUENTIAL: Avoid Rayon overhead for small candidate sets
+        all_candidates
+            .iter()
+            .filter_map(evaluate_candidate)
+            .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+    };
+
+    // Return the best granularity found, or fall back to native
+    best_result
+        .map(|(_, granularity)| granularity)
+        .unwrap_or_else(|| problem.native_granularity.clone())
 }
 
 /// Quick latency estimation for a granularity choice (used in search)
@@ -912,5 +1236,184 @@ mod tests {
         let granularity = problem.native_granularity.clone();
         let cost = compute_subgraph_compute_cost(&[0], &problem, &granularity);
         assert!(cost > 0.0 && cost.is_finite(), "Cost should be positive for small tensors");
+    }
+
+    #[test]
+    fn test_register_tiling_matmul_large_tile() {
+        // Test that large MatMul tiles get the full register tiling bonus
+        // A 128x128 tile has 16x16 = 256 micro-blocks of 8x8
+        let factor = compute_register_tiling_factor(128, 128, &OpType::MatMul);
+
+        // Should get significant bonus (10-15% reduction)
+        assert!(factor < 0.95, "Large MatMul tile should get register tiling bonus: {}", factor);
+        assert!(factor >= 1.0 - MAX_REGISTER_REUSE_BONUS,
+            "Factor should not exceed max bonus: {}", factor);
+    }
+
+    #[test]
+    fn test_register_tiling_small_tile_no_bonus() {
+        // Small tiles (< 16x16) shouldn't benefit from register tiling
+        let factor = compute_register_tiling_factor(8, 8, &OpType::MatMul);
+
+        // Should get no bonus (factor = 1.0)
+        assert!((factor - 1.0).abs() < 0.001,
+            "Small tile should not get register tiling bonus: {}", factor);
+    }
+
+    #[test]
+    fn test_register_tiling_pointwise_modest_bonus() {
+        // Pointwise ops should get a smaller bonus than MatMul
+        let matmul_factor = compute_register_tiling_factor(128, 128, &OpType::MatMul);
+        let pointwise_factor = compute_register_tiling_factor(128, 128, &OpType::Pointwise);
+
+        // Pointwise should have higher factor (less bonus) than MatMul
+        assert!(pointwise_factor > matmul_factor,
+            "Pointwise {} should have less bonus than MatMul {}", pointwise_factor, matmul_factor);
+
+        // But pointwise should still get some bonus for large tiles
+        assert!(pointwise_factor < 1.0,
+            "Large pointwise tile should get some bonus: {}", pointwise_factor);
+    }
+
+    #[test]
+    fn test_register_tiling_affects_compute_cost() {
+        // Verify that register tiling actually reduces compute cost
+        let op = Op {
+            op_type: OpType::MatMul,
+            inputs: vec![0, 1],
+            outputs: vec![2],
+            base_cost: 10000,
+        };
+        let native = Granularity::new(128, 128, 1);
+        let output_tensor = Tensor { width: 128, height: 128 };
+
+        let cost_large_tile = compute_op_cost(&op, &native, &Granularity::new(128, 128, 1), &output_tensor);
+
+        // Compare with a smaller tile that has less register reuse
+        let cost_small_tile = compute_op_cost(&op, &native, &Granularity::new(16, 16, 1), &output_tensor);
+
+        // The 16x16 tile still gets some bonus, but processing 64 tiles adds overhead
+        // Large tile should be more efficient overall due to register tiling
+        // Note: smaller tiles have inefficiency penalty too, but register tiling helps
+        assert!(cost_large_tile < cost_small_tile,
+            "Large tile {} should have lower cost than many small tiles {}",
+            cost_large_tile, cost_small_tile);
+    }
+
+    #[test]
+    fn test_register_tiling_asymmetric_tiles() {
+        // Test asymmetric tiles (e.g., 64x256)
+        let factor_wide = compute_register_tiling_factor(64, 256, &OpType::MatMul);
+        let factor_tall = compute_register_tiling_factor(256, 64, &OpType::MatMul);
+        let factor_square = compute_register_tiling_factor(128, 128, &OpType::MatMul);
+
+        // All should get bonuses for large tiles
+        assert!(factor_wide < 0.95, "Wide tile should get bonus: {}", factor_wide);
+        assert!(factor_tall < 0.95, "Tall tile should get bonus: {}", factor_tall);
+        assert!(factor_square < 0.95, "Square tile should get bonus: {}", factor_square);
+
+        // All should be reasonable (not too different)
+        assert!((factor_wide - factor_tall).abs() < 0.1,
+            "Wide {} and tall {} should have similar factors", factor_wide, factor_tall);
+    }
+
+    #[test]
+    fn test_shape_aware_candidates_generation() {
+        // Test that shape-aware candidates are generated for different tensor shapes
+        let problem_wide = crate::models::Problem {
+            tensors: vec![
+                Tensor { width: 512, height: 64 },  // Very wide input
+                Tensor { width: 512, height: 64 },  // Very wide output
+            ],
+            ops: vec![Op {
+                op_type: OpType::MatMul,
+                inputs: vec![0],
+                outputs: vec![1],
+                base_cost: 10000,
+            }],
+            fast_memory_capacity: 100000,
+            slow_memory_bandwidth: 10,
+            native_granularity: Granularity::new(128, 128, 1),
+        };
+
+        let candidates = generate_shape_aware_candidates(&[0], &problem_wide);
+
+        // Should include base candidates
+        assert!(candidates.contains(&(128, 128)), "Should include base square tile");
+        assert!(candidates.contains(&(64, 256)), "Should include base wide tile");
+
+        // Should include asymmetric candidates for wide matrices
+        assert!(candidates.iter().any(|&(w, h)| w > h * 2),
+            "Should include extra-wide candidates for wide tensor");
+    }
+
+    #[test]
+    fn test_shape_match_bonus() {
+        // Test shape matching bonus calculation
+        let wide_tensor = Tensor { width: 256, height: 64 };
+        let tall_tensor = Tensor { width: 64, height: 256 };
+        let square_tensor = Tensor { width: 128, height: 128 };
+
+        // Wide tile should match wide tensor better
+        let bonus_wide_wide = compute_shape_match_bonus(256, 64, &wide_tensor);
+        let bonus_wide_tall = compute_shape_match_bonus(256, 64, &tall_tensor);
+        assert!(bonus_wide_wide < bonus_wide_tall,
+            "Wide tile {} should match wide tensor better than tall tensor {}",
+            bonus_wide_wide, bonus_wide_tall);
+
+        // Tall tile should match tall tensor better
+        let bonus_tall_tall = compute_shape_match_bonus(64, 256, &tall_tensor);
+        let bonus_tall_wide = compute_shape_match_bonus(64, 256, &wide_tensor);
+        assert!(bonus_tall_tall < bonus_tall_wide,
+            "Tall tile {} should match tall tensor better than wide tensor {}",
+            bonus_tall_tall, bonus_tall_wide);
+
+        // Square tile should work reasonably for square tensor
+        let bonus_square = compute_shape_match_bonus(128, 128, &square_tensor);
+        assert!(bonus_square <= 0.95, "Square tile should get good bonus for square tensor: {}", bonus_square);
+    }
+
+    #[test]
+    fn test_find_best_tiling_prefers_shape_matched() {
+        // Test that find_best_tiling prefers shape-matched tiles
+        let problem = crate::models::Problem {
+            tensors: vec![
+                Tensor { width: 512, height: 64 },  // Wide input
+                Tensor { width: 512, height: 64 },  // Wide output
+            ],
+            ops: vec![Op {
+                op_type: OpType::MatMul,
+                inputs: vec![0],
+                outputs: vec![1],
+                base_cost: 10000,
+            }],
+            fast_memory_capacity: 100000,
+            slow_memory_bandwidth: 10,
+            native_granularity: Granularity::new(128, 128, 1),
+        };
+
+        let tensor_meta = problem.build_tensor_meta();
+        let memory_state = MemoryState::new();
+
+        let best = find_best_tiling(&[0], &problem, &tensor_meta, &memory_state, &[]);
+
+        // For a very wide tensor (512x64), the best tiling should have width >= height
+        // (it should prefer wide tiles over square or tall tiles)
+        assert!(best.width >= best.height,
+            "For wide tensor (512x64), should prefer wide tile, got {}x{}",
+            best.width, best.height);
+    }
+
+    #[test]
+    fn test_extended_asymmetric_candidates() {
+        // Verify extended asymmetric candidates are available
+        assert!(ASYMMETRIC_TILING_CANDIDATES.len() >= 6,
+            "Should have at least 6 asymmetric candidates");
+
+        // Should include extreme ratios
+        assert!(ASYMMETRIC_TILING_CANDIDATES.iter().any(|&(w, h)| w >= 4 * h),
+            "Should include very wide candidate (ratio >= 4:1)");
+        assert!(ASYMMETRIC_TILING_CANDIDATES.iter().any(|&(w, h)| h >= 4 * w),
+            "Should include very tall candidate (ratio >= 1:4)");
     }
 }
