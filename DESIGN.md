@@ -2,6 +2,36 @@
 
 This document explains the engineering decisions and optimization philosophy behind this graph scheduler implementation.
 
+## Project Structure
+
+```
+MLSys/
+  src/              - Our Rust implementation
+    main.rs         - CLI entry point, argument parsing, JSON I/O
+    lib.rs          - Module exports
+    models.rs       - Data structures (Problem, Solution, Tensor, Op, Granularity)
+    scheduler.rs    - Main scheduling algorithm with fusion and SRAM management
+    cost.rs         - Latency cost model with all optimizations
+    memory.rs       - SRAM working set computation
+    liveness.rs     - Tensor lifetime analysis for retention decisions
+    telemetry.rs    - Engineering decision logging system
+
+  benchmarks/       - Contest benchmark inputs (5 released problems)
+    mlsys-2026-1.json   - Small: 5 ops, 9 tensors
+    mlsys-2026-5.json   - Medium: 19 ops, 29 tensors
+    mlsys-2026-9.json   - Medium: 32 ops, 49 tensors
+    mlsys-2026-13.json  - Large: 63 ops, 100 tensors
+    mlsys-2026-17.json  - Large: 103 ops, 160 tensors
+
+  original/         - Original contest materials from Google
+    mlsys.h         - C++ header with Problem/Solution class definitions
+    install.sh      - Original setup script
+    CONTRIBUTING.md - Contest contribution guidelines
+
+  logs/             - Development logs (gitignored, local only)
+  solutions/        - Generated solution JSON files (gitignored, local only)
+```
+
 ## Core Principle: Latency = max(Compute, Memory)
 
 The fundamental insight driving all our optimizations is that in modern hardware, execution time is dominated by either compute or memory transfer - whichever is slower. Our goal is to balance both so neither becomes a bottleneck.

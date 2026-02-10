@@ -64,7 +64,18 @@ Example output:
 [FUSION] Subgraph 0: Fused 5 ops | Eliminated 4 intermediates | Saved 2097152 bytes DRAM traffic
 ```
 
-## Architecture
+## Project Structure
+
+```
+MLSys/
+  src/           - Rust source code (our implementation)
+  benchmarks/    - Input benchmark files from the contest
+  original/      - Original contest scripts and C++ header (mlsys.h, install.sh)
+  logs/          - Development logs (gitignored)
+  solutions/     - Generated solution outputs (gitignored)
+```
+
+### Source Code
 
 ```
 src/
