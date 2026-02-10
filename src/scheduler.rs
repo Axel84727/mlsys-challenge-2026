@@ -65,7 +65,7 @@ pub fn build_op_dag(problem: &Problem) -> (DiGraph<OpNode, ()>, HashMap<OpId, No
 
     // Add edges based on tensor dependencies
     let tensor_meta = problem.build_tensor_meta();
-    for (_tensor_id, meta) in tensor_meta.iter().enumerate() {
+    for meta in tensor_meta.iter() {
         if let Some(producer) = meta.producer {
             for &consumer in &meta.consumers {
                 let from = op_to_node[&producer];
@@ -256,7 +256,7 @@ impl<'a> SchedulerState<'a> {
         // Ops whose inputs come directly from current subgraph
         let is_direct_successor = op.inputs.iter().any(|&input_id| {
             let meta = &self.tensor_meta[input_id];
-            meta.producer.map_or(false, |p| current_subgraph.contains(&p))
+            meta.producer.is_some_and(|p| current_subgraph.contains(&p))
         });
         if is_direct_successor {
             priority += 15_000;
@@ -1359,7 +1359,7 @@ mod tests {
     #[test]
     fn test_build_dag() {
         let problem = make_test_problem();
-        let (graph, op_to_node) = build_op_dag(&problem);
+        let (graph, _op_to_node) = build_op_dag(&problem);
 
         assert_eq!(graph.node_count(), 2);
         assert_eq!(graph.edge_count(), 1);

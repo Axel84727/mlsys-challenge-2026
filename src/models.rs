@@ -57,12 +57,20 @@ pub enum OpType {
     MatMul,
 }
 
-impl OpType {
-    pub fn from_str(s: &str) -> Self {
+impl std::str::FromStr for OpType {
+    type Err = ();
+    
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "MatMul" => OpType::MatMul,
-            _ => OpType::Pointwise,
+            "MatMul" => Ok(OpType::MatMul),
+            _ => Ok(OpType::Pointwise),
         }
+    }
+}
+
+impl OpType {
+    pub fn parse(s: &str) -> Self {
+        s.parse().unwrap_or(OpType::Pointwise)
     }
 
     pub fn as_str(&self) -> &'static str {
@@ -118,7 +126,7 @@ impl Granularity {
     /// Create from native granularity array [w, h] or [w, h, d]
     pub fn from_array(arr: &[i64]) -> Self {
         Self {
-            width: arr.get(0).copied().unwrap_or(1),
+            width: arr.first().copied().unwrap_or(1),
             height: arr.get(1).copied().unwrap_or(1),
             depth: arr.get(2).copied().unwrap_or(1),
         }
@@ -198,7 +206,7 @@ impl From<ProblemJson> for Problem {
             .zip(json.outputs.iter())
             .zip(json.base_costs.iter())
             .map(|(((op_type, inputs), outputs), &base_cost)| Op {
-                op_type: OpType::from_str(op_type),
+                op_type: OpType::parse(op_type),
                 inputs: inputs.clone(),
                 outputs: outputs.clone(),
                 base_cost,
@@ -247,7 +255,7 @@ pub struct GranularityOutput {
 }
 
 fn is_one(k: &Option<Depth>) -> bool {
-    k.map_or(true, |v| v == 1)
+    k.is_none_or(|v| v == 1)
 }
 
 impl From<&Granularity> for GranularityOutput {

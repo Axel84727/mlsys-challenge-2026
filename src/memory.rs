@@ -113,7 +113,7 @@ pub fn compute_subgraph_working_set(
         for &input_id in &op.inputs {
             let meta = &tensor_meta[input_id];
             // External if producer is outside subgraph or it's a graph input
-            if meta.producer.map_or(true, |p| !ops_set.contains(&p)) {
+            if meta.producer.is_none_or(|p| !ops_set.contains(&p)) {
                 external_inputs.insert(input_id);
             }
         }
