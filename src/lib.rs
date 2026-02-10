@@ -8,8 +8,10 @@
 //! - `scheduler`: Greedy fusion engine with aggressive operator fusion
 //! - `memory`: SRAM capacity management and working set computation
 //! - `cost`: Latency model for subgraph evaluation
+//! - `liveness`: Tensor liveness analysis for optimal SRAM allocation
 
 pub mod cost;
+pub mod liveness;
 pub mod memory;
 pub mod models;
 pub mod scheduler;

@@ -12,7 +12,7 @@ use std::io::Write;
 use std::time::Instant;
 
 use mlsys::cost::compute_total_latency;
-use mlsys::models::{Problem, ProblemJson, Solution};
+use mlsys::models::{Problem, ProblemJson};
 use mlsys::scheduler::{optimize_schedule, schedule};
 
 fn main() -> Result<()> {

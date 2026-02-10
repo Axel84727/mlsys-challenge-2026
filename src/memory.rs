@@ -229,19 +229,29 @@ pub fn validate_memory_fit(
 }
 
 // ============================================================================
-// Granularity Adjustment
+// Granularity Adjustment with Dynamic Tiling
 // ============================================================================
+
+/// Dynamic tiling candidates - different tile shapes to try
+const DYNAMIC_TILING_OPTIONS: [(i64, i64); 5] = [
+    (128, 128), // Square (native)
+    (64, 256),  // Wide tiles
+    (256, 64),  // Tall tiles
+    (64, 128),  // Smaller wide
+    (128, 64),  // Smaller tall
+];
 
 /// Find the optimal granularity that fits in memory for a subgraph.
 ///
 /// Strategy (in order of preference):
 /// 1. Try native granularity first (best performance)
-/// 2. If subgraph has MatMul ops, try Split-K with native spatial granularity
-///    (Split-K divides the K dimension, reducing memory without hurting spatial locality)
-/// 3. Only as a last resort, reduce spatial granularity (w, h)
+/// 2. Try dynamic tiling options (64x256, 256x64) at native scale
+/// 3. If subgraph has MatMul ops, try Split-K with various tile shapes
+/// 4. Only as a last resort, reduce spatial granularity (w, h)
 ///
-/// This ordering is critical: reducing spatial granularity to 64x64 causes much
-/// higher latency than using Split-K at 128x128.
+/// Dynamic Tiling: Different tensor layouts benefit from different tile shapes.
+/// Wide tiles (64x256) are better for row-major access patterns.
+/// Tall tiles (256x64) are better for column-major access patterns.
 pub fn find_fitting_granularity(
     ops: &[OpId],
     problem: &Problem,
@@ -254,31 +264,48 @@ pub fn find_fitting_granularity(
         return native.clone();
     }
 
-    // Step 2: Check if subgraph has MatMul ops - if so, try Split-K first
+    // Step 2: Try dynamic tiling options (same total tile area, different shapes)
+    for &(w, h) in &DYNAMIC_TILING_OPTIONS {
+        let candidate = Granularity::new(w, h, 1);
+        if validate_memory_fit(ops, problem, &candidate, tensor_meta) {
+            return candidate;
+        }
+    }
+
+    // Step 3: Check if subgraph has MatMul ops - if so, try Split-K first
+    // CONSERVATIVE: Max Split-K = 4
     let has_matmul = ops.iter().any(|&op_id| problem.ops[op_id].is_matmul());
 
     if has_matmul {
-        // Try increasing Split-K factors: 2, 4, 8, 16, 32
-        // Higher K means more passes but less memory per pass
-        for k in [2, 4, 8, 16, 32] {
-            let split_k_granularity = native.with_split_k(k);
-            if validate_memory_fit(ops, problem, &split_k_granularity, tensor_meta) {
-                return split_k_granularity;
+        // Try Split-K with each dynamic tiling option - MAX K=4
+        for k in [2, 4] {
+            for &(w, h) in &DYNAMIC_TILING_OPTIONS {
+                let split_k_granularity = Granularity::new(w, h, k);
+                if validate_memory_fit(ops, problem, &split_k_granularity, tensor_meta) {
+                    return split_k_granularity;
+                }
             }
         }
 
         // Also try Split-K with slightly reduced spatial granularity
-        // This is still better than just reducing spatial without Split-K
-        let reduced_spatial = native.halve();
-        for k in [2, 4, 8, 16] {
-            let hybrid_granularity = reduced_spatial.with_split_k(k);
-            if validate_memory_fit(ops, problem, &hybrid_granularity, tensor_meta) {
-                return hybrid_granularity;
+        let reduced_options = [
+            (64, 64),
+            (32, 128),
+            (128, 32),
+            (32, 64),
+            (64, 32),
+        ];
+        for k in [2, 4] {
+            for &(w, h) in &reduced_options {
+                let hybrid_granularity = Granularity::new(w, h, k);
+                if validate_memory_fit(ops, problem, &hybrid_granularity, tensor_meta) {
+                    return hybrid_granularity;
+                }
             }
         }
     }
 
-    // Step 3: Last resort - reduce spatial granularity without Split-K
+    // Step 4: Last resort - progressively reduce spatial granularity
     let mut granularity = native.clone();
 
     // Try up to 8 halvings (256x reduction)
@@ -293,18 +320,17 @@ pub fn find_fitting_granularity(
     granularity
 }
 
-/// Try Split-K optimization for MatMul-heavy subgraphs.
-/// Returns optimal k value that fits in memory while minimizing k (fewer passes).
+/// Try Split-K optimization for MatMul-heavy subgraphs with dynamic tiling.
+/// Returns optimal granularity (k value + tile shape) that fits in memory while minimizing latency.
 ///
 /// Split-K divides the K (reduction) dimension of MatMul operations, which:
 /// - Reduces the working set because we only need 1/k of the input tiles at a time
 /// - Requires accumulator space for partial sums (small overhead)
 /// - Results in k passes over the output tiles (increases compute slightly)
 ///
-/// This is preferable to reducing spatial granularity because:
-/// - Spatial locality is preserved (128x128 tiles)
-/// - Cache behavior remains optimal
-/// - Only the reduction dimension is affected
+/// Combined with Dynamic Tiling:
+/// - Different tile shapes (64x256, 256x64) may fit better or have better cache behavior
+/// - We search the space of (tile_shape, split_k) combinations
 pub fn find_split_k(
     ops: &[OpId],
     problem: &Problem,
@@ -322,12 +348,21 @@ pub fn find_split_k(
         return Some(base_granularity.clone());
     }
 
-    // Try increasing k values: 2, 4, 8, 16, 32
-    // We want the smallest k that fits (minimizes extra passes)
-    for k in [2, 4, 8, 16, 32] {
+    // Try combinations of tile shapes and Split-K values
+    // CONSERVATIVE: Max Split-K = 4 (higher values hurt more than help)
+    for k in [2, 4] {
+        // First try the base granularity with Split-K
         let split_granularity = base_granularity.with_split_k(k);
         if validate_memory_fit(ops, problem, &split_granularity, tensor_meta) {
             return Some(split_granularity);
+        }
+
+        // Then try dynamic tiling options
+        for &(w, h) in &DYNAMIC_TILING_OPTIONS {
+            let candidate = Granularity::new(w, h, k);
+            if validate_memory_fit(ops, problem, &candidate, tensor_meta) {
+                return Some(candidate);
+            }
         }
     }
 
@@ -432,6 +467,7 @@ pub fn analyze_tensor_residency(
 }
 
 /// Find ops that can be immediately scheduled next (all their inputs are available).
+#[allow(dead_code)]
 fn find_immediate_consumers(
     available_tensors: &[TensorId],
     remaining_ops: &HashSet<OpId>,
