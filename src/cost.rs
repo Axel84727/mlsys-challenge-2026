@@ -236,8 +236,14 @@ pub fn estimate_snake_savings(
 // Subgraph Latency Calculation
 // ============================================================================
 
+/// Fixed hardware setup cost per subgraph (cycles).
+/// This penalty encourages the scheduler to fuse more operations together
+/// to amortize the setup overhead across more useful work.
+/// Keep this relatively small to not dominate the latency calculation.
+pub const SUBGRAPH_SETUP_PENALTY: f64 = 100.0;
+
 /// Calculate the total latency for a subgraph.
-/// Latency = max(compute_time, memory_time)
+/// Latency = max(compute_time, memory_time) + setup_penalty
 pub fn compute_subgraph_latency(
     ops: &[OpId],
     problem: &Problem,
@@ -268,8 +274,9 @@ pub fn compute_subgraph_latency(
         }
     }
 
-    // Latency is the maximum of compute and memory time
-    compute_cost.max(memory_cost)
+    // Latency is the maximum of compute and memory time, PLUS setup penalty
+    // The setup penalty discourages creating many small subgraphs
+    compute_cost.max(memory_cost) + SUBGRAPH_SETUP_PENALTY
 }
 
 /// Calculate total latency for a complete solution
