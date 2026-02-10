@@ -360,13 +360,15 @@ pub fn estimate_retention_savings(
     tensor_size * consumer_count
 }
 
-/// Analyze which tensors should be kept resident in fast memory
-/// to avoid costly DRAM transfers between subgraphs.
+/// SRAM-Glutton: Aggressively retain ALL tensors that have future consumers and fit in SRAM.
+///
+/// Philosophy: We have 500k SRAM and tensors are ~16k each. We can hold 30+ tensors!
+/// There's no reason to be conservative. If a tensor will be needed later, KEEP IT.
 ///
 /// Strategy:
-/// 1. Identify tensors produced by current subgraph that have consumers in remaining ops
-/// 2. Prioritize by: immediate consumption (next subgraph) > multiple consumers > single consumer
-/// 3. Greedily select tensors that maximize savings within available capacity
+/// 1. ANY tensor with future consumers should be retained if it fits
+/// 2. Prioritize by savings (more consumers = more valuable)
+/// 3. Fill SRAM to capacity - don't leave space unused
 pub fn analyze_tensor_residency(
     current_subgraph_outputs: &[TensorId],
     remaining_ops: &[OpId],
@@ -380,68 +382,46 @@ pub fn analyze_tensor_residency(
 
     let remaining_set: HashSet<OpId> = remaining_ops.iter().copied().collect();
 
-    // Find the "next" ops - those whose all inputs are either:
-    // 1. Graph inputs (no producer)
-    // 2. Produced by already-scheduled ops (current subgraph outputs or earlier)
-    // These are the immediate consumers that benefit most from retention.
-    let next_op_consumers: HashSet<OpId> = find_immediate_consumers(
-        current_subgraph_outputs,
-        &remaining_set,
-        problem,
-        tensor_meta,
-    );
-
-    // (tensor_id, size, consumer_count, is_immediate, savings_ratio)
-    let mut candidates: Vec<(TensorId, i64, usize, bool, f64)> = Vec::new();
+    // Collect ALL tensors that have future consumers - we want to keep them ALL
+    // (tensor_id, size, consumer_count, total_savings)
+    let mut candidates: Vec<(TensorId, i64, usize, i64)> = Vec::new();
 
     for &tensor_id in current_subgraph_outputs {
         let meta = &tensor_meta[tensor_id];
         let tensor_size = problem.tensors[tensor_id].size();
 
-        // Find remaining consumers
-        let consumers_in_remaining: Vec<OpId> = meta
+        // Count remaining consumers
+        let consumer_count = meta
             .consumers
             .iter()
-            .copied()
             .filter(|c| remaining_set.contains(c))
-            .collect();
+            .count();
 
-        if consumers_in_remaining.is_empty() {
-            continue; // No benefit from retaining
+        if consumer_count == 0 {
+            continue; // No future consumers - don't bother
         }
 
-        let consumer_count = consumers_in_remaining.len();
+        // Calculate total bytes saved by retaining this tensor
+        let total_savings = tensor_size * consumer_count as i64;
 
-        // Check if any consumer is immediate (will be scheduled next)
-        let is_immediate = consumers_in_remaining
-            .iter()
-            .any(|c| next_op_consumers.contains(c));
-
-        // Calculate savings ratio: total bytes saved / bytes used in memory
-        let total_savings = estimate_retention_savings(tensor_id, problem, tensor_meta, &remaining_set);
-        let savings_ratio = total_savings as f64 / tensor_size as f64;
-
-        candidates.push((tensor_id, tensor_size, consumer_count, is_immediate, savings_ratio));
+        candidates.push((tensor_id, tensor_size, consumer_count, total_savings));
     }
 
-    // Sort by priority:
-    // 1. Immediate consumers first (highest priority)
-    // 2. Higher savings ratio (more consumers or smaller tensor)
-    // 3. Smaller size (to fit more tensors)
+    // Sort by value: higher savings first, then by size (smaller = fit more)
     candidates.sort_by(|a, b| {
-        // is_immediate: true > false
+        // Higher savings is better
         b.3.cmp(&a.3)
-            // savings_ratio: higher is better
-            .then_with(|| b.4.partial_cmp(&a.4).unwrap_or(std::cmp::Ordering::Equal))
-            // size: smaller is better
+            // Tie-breaker: more consumers
+            .then_with(|| b.2.cmp(&a.2))
+            // Tie-breaker: smaller size (can fit more)
             .then_with(|| a.1.cmp(&b.1))
     });
 
-    // Greedily select tensors that fit in available capacity
+    // GREEDY: Take EVERYTHING that fits!
     let mut selected = Vec::new();
     let mut used_capacity = 0i64;
 
-    for (tensor_id, size, _count, _immediate, _ratio) in candidates {
+    for (tensor_id, size, _count, _savings) in candidates {
         if used_capacity + size <= available_capacity {
             selected.push(tensor_id);
             used_capacity += size;
@@ -481,6 +461,9 @@ fn find_immediate_consumers(
 
 /// Calculate the available capacity for tensor retention after accounting for
 /// the working set of the current subgraph execution.
+///
+/// SRAM-Glutton: Be aggressive! Use as much SRAM as possible.
+/// Only keep a minimal 5% margin for safety.
 pub fn compute_available_retention_capacity(
     ops: &[OpId],
     problem: &Problem,
@@ -490,8 +473,8 @@ pub fn compute_available_retention_capacity(
     let ws = compute_subgraph_working_set(ops, problem, granularity, tensor_meta);
 
     // Available = total capacity - working set
-    // But we need some margin for execution overhead
-    let margin = problem.fast_memory_capacity / 10; // 10% margin
+    // Use minimal margin - we want to use as much SRAM as possible!
+    let margin = problem.fast_memory_capacity / 20; // Only 5% margin
     let available = problem.fast_memory_capacity - ws.total_size - margin;
 
     available.max(0)
