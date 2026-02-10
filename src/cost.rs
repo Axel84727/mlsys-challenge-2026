@@ -23,12 +23,16 @@ use std::collections::HashSet;
 #[allow(dead_code)]
 pub const SPLIT_K_THRESHOLD: i64 = 512;
 
-/// Double buffering overlap factor (how much memory transfer can be hidden)
+/// Double buffering overlap factor (fallback when compute time is unknown)
 /// Modern hardware with good prefetching can hide 85%+ of memory latency
-pub const DOUBLE_BUFFER_OVERLAP: f64 = 0.85;
+pub const DOUBLE_BUFFER_OVERLAP_FALLBACK: f64 = 0.85;
 
 /// Minimum ops in subgraph to benefit from double buffering
 pub const DOUBLE_BUFFER_MIN_OPS: usize = 2;
+
+/// Minimum compute-to-memory ratio for FULL overlap (memory cost = 0)
+/// When compute_time >= memory_transfer_time * this ratio, prefetch fully hides transfer
+pub const FULL_OVERLAP_THRESHOLD: f64 = 1.0;
 
 /// Maximum reasonable Split-K factor (for safety bounds)
 pub const MAX_REASONABLE_SPLIT_K: i64 = 64;
@@ -277,10 +281,15 @@ impl MemoryState {
 ///
 /// SRAM O(1) Optimization: Tensors already resident in SRAM have ZERO read cost.
 /// Double Buffering: For multi-op subgraphs, transfers are overlapped with compute.
+///
+/// NEW: Compute-Aware Prefetch Model
+/// Instead of a fixed overlap factor, we calculate the actual compute time for each tile
+/// and compare it with the memory transfer time for prefetching. If compute completely
+/// covers the prefetch time, memory cost is effectively zero.
 pub fn compute_memory_transfer_cost(
     ops: &[OpId],
     problem: &Problem,
-    _granularity: &Granularity,
+    granularity: &Granularity,
     tensor_meta: &[TensorMeta],
     memory_state: &MemoryState,
     tensors_to_retain: &[TensorId],
@@ -342,16 +351,51 @@ pub fn compute_memory_transfer_cost(
         }
     }
 
-    // Double Buffering Optimization: Overlap memory transfers with compute
-    // When we have multiple ops, we can pre-load the next block's data while
-    // processing the current block, effectively hiding transfer latency.
+    // ================================================================
+    // Compute-Aware Prefetch Model (Double Buffering with Real Overlap)
+    // ================================================================
+    //
+    // Key insight: Instead of using a fixed overlap factor (0.85), we calculate
+    // the actual compute time per tile and compare it with the prefetch time.
+    //
+    // If compute_time >= prefetch_time: memory cost is ZERO (fully hidden)
+    // If compute_time < prefetch_time: memory cost is (prefetch_time - compute_time)
+    //
+    // This incentivizes the scheduler to choose granularities where compute
+    // "covers" the memory transfer, enabling full prefetch hiding.
+
     let total_dram_bytes = read_cost + write_cost;
+
     let effective_dram_cost = if ops.len() >= DOUBLE_BUFFER_MIN_OPS && total_dram_bytes > 0.0 {
-        // Double buffering hides a portion of the transfer cost
-        // The overlap factor determines how much can be hidden
-        total_dram_bytes * (1.0 - DOUBLE_BUFFER_OVERLAP) +
-        total_dram_bytes * DOUBLE_BUFFER_OVERLAP * 0.1 // Residual sync overhead
+        // Calculate compute time for the subgraph (per tile)
+        let compute_cost = compute_subgraph_compute_cost(ops, problem, granularity);
+
+        // Calculate raw memory transfer time (per tile)
+        let raw_memory_latency = total_dram_bytes / problem.slow_memory_bandwidth as f64;
+
+        // Calculate the compute-to-memory ratio
+        // This represents how much of the memory transfer can be hidden by compute
+        let compute_to_memory_ratio = if raw_memory_latency > 0.0 {
+            compute_cost / raw_memory_latency
+        } else {
+            f64::MAX
+        };
+
+        if compute_to_memory_ratio >= FULL_OVERLAP_THRESHOLD {
+            // Full overlap: compute completely covers memory transfer
+            // Only minimal synchronization overhead remains
+            total_dram_bytes * 0.02 // ~2% residual sync overhead
+        } else {
+            // Partial overlap: compute covers some of the memory transfer
+            // The exposed memory time is proportional to what compute couldn't hide
+            let hidden_fraction = compute_to_memory_ratio.min(1.0);
+            let exposed_fraction = 1.0 - hidden_fraction;
+
+            // Exposed memory cost + small overhead for buffering coordination
+            total_dram_bytes * exposed_fraction + total_dram_bytes * hidden_fraction * 0.05
+        }
     } else {
+        // No double buffering (single op or no memory transfers)
         total_dram_bytes
     };
 
@@ -731,18 +775,67 @@ mod tests {
         let granularity = problem.native_granularity.clone();
         let empty_state = MemoryState::new();
 
-        // Multi-op subgraph (benefits from double buffering)
+        // Multi-op subgraph (benefits from compute-aware prefetch)
         let cost_multi_op = compute_memory_transfer_cost(
             &[0, 1], &problem, &granularity, &tensor_meta, &empty_state, &[],
         );
 
-        // Cost should be reduced by double buffering overlap factor
-        // With DOUBLE_BUFFER_OVERLAP = 0.7, effective cost is ~37% of raw cost
+        // With compute-aware prefetch: if compute_time >= memory_time, cost is nearly zero
+        // Compute: 100 + 100 = 200, Memory: (128*128*2)/10 = 3276.8
+        // Ratio = 200/3276.8 ≈ 0.061, so partial overlap applies
+        // The key is that multi-op should still have lower cost than raw
         let raw_bytes = (128 * 128 * 2) as f64; // Input + output
         let raw_cost = raw_bytes / 10.0;
 
-        // Multi-op should have significant savings from double buffering
-        assert!(cost_multi_op < raw_cost * 0.5);
+        // Multi-op should have savings from the partial overlap
+        assert!(cost_multi_op < raw_cost,
+            "Multi-op cost {} should be less than raw cost {}", cost_multi_op, raw_cost);
+    }
+
+    #[test]
+    fn test_compute_aware_prefetch_full_overlap() {
+        // Test that high-compute ops get full overlap (near-zero memory cost)
+        let problem = crate::models::Problem {
+            tensors: vec![
+                Tensor { width: 128, height: 128 },
+                Tensor { width: 128, height: 128 },
+                Tensor { width: 128, height: 128 },
+            ],
+            ops: vec![
+                Op {
+                    op_type: OpType::MatMul,
+                    inputs: vec![0],
+                    outputs: vec![1],
+                    base_cost: 50000, // High compute cost
+                },
+                Op {
+                    op_type: OpType::Pointwise,
+                    inputs: vec![1],
+                    outputs: vec![2],
+                    base_cost: 1000,
+                },
+            ],
+            fast_memory_capacity: 50000,
+            slow_memory_bandwidth: 10,
+            native_granularity: Granularity::new(128, 128, 1),
+        };
+
+        let tensor_meta = problem.build_tensor_meta();
+        let granularity = problem.native_granularity.clone();
+        let empty_state = MemoryState::new();
+
+        let cost = compute_memory_transfer_cost(
+            &[0, 1], &problem, &granularity, &tensor_meta, &empty_state, &[],
+        );
+
+        // With high compute (50000 + 1000) vs memory (128*128*2/10 ≈ 3277)
+        // Ratio ≈ 15.6, well above 1.0, so full overlap should apply
+        // Memory cost should be ~2% of raw
+        let raw_bytes = (128 * 128 * 2) as f64;
+        let raw_cost = raw_bytes / 10.0;
+
+        assert!(cost < raw_cost * 0.1,
+            "High-compute should get near-full overlap: {} vs raw {}", cost, raw_cost);
     }
 
     #[test]
