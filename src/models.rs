@@ -51,7 +51,7 @@ impl Tensor {
 }
 
 /// Operation types supported by the system
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum OpType {
     Pointwise,
     MatMul,

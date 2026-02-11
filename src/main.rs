@@ -21,6 +21,7 @@ use std::io::Write;
 use std::time::Instant;
 
 use mlsys::cost::compute_total_latency;
+use mlsys::graph_rewrite::canonicalize_graph;
 use mlsys::models::{Problem, ProblemJson};
 use mlsys::scheduler::{optimize_schedule, schedule};
 use mlsys::telemetry;
@@ -65,7 +66,7 @@ fn main() -> Result<()> {
     let problem_json: ProblemJson = serde_json::from_str(&input_data)
         .with_context(|| "Failed to parse input JSON")?;
 
-    let problem: Problem = problem_json.into();
+    let mut problem: Problem = problem_json.into();
 
     eprintln!("[*] Problem loaded in {:?}", start.elapsed());
     eprintln!("    - Tensors: {}", problem.tensors.len());
@@ -78,6 +79,19 @@ fn main() -> Result<()> {
         problem.native_granularity.height,
         problem.native_granularity.depth
     );
+
+    // === Graph Canonicalization Phase ===
+    eprintln!("[*] Running graph canonicalization...");
+    let canon_start = Instant::now();
+    
+    let canon_stats = canonicalize_graph(&mut problem);
+    
+    eprintln!("[*] Canonicalization completed in {:?}", canon_start.elapsed());
+    canon_stats.report();
+    
+    eprintln!("[*] Canonicalized graph:");
+    eprintln!("    - Operations: {}", problem.ops.len());
+    eprintln!("    - Tensors: {}", problem.tensors.len());
 
     // Run scheduler
     eprintln!("[*] Running scheduler...");

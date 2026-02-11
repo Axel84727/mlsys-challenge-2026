@@ -18,6 +18,7 @@ anyhow = "1.0"
 rayon = "1.10"
 log = "0.4"
 env_logger = "0.11"
+bumpalo = "3.16"  # Bump allocator for O(1) allocation
 
 [profile.release]
 opt-level = 3
