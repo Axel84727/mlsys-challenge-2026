@@ -225,7 +225,23 @@ pub fn validate_memory_fit(
     tensor_meta: &[TensorMeta],
 ) -> bool {
     let ws = compute_subgraph_working_set(ops, problem, granularity, tensor_meta);
-    ws.fits_in(problem.fast_memory_capacity)
+    let fits = ws.fits_in(problem.fast_memory_capacity);
+
+    // Debug: log when granularity doesn't fit
+    #[cfg(debug_assertions)]
+    if !fits && ops.len() > 10 {
+        eprintln!(
+            "[DEBUG] Granularity {:?} doesn't fit: working_set={} > capacity={} ({} ops, {} inputs, {} outputs)",
+            (granularity.width, granularity.height, granularity.depth),
+            ws.total_size,
+            problem.fast_memory_capacity,
+            ops.len(),
+            ws.input_slices.len(),
+            ws.output_slices.len()
+        );
+    }
+
+    fits
 }
 
 // ============================================================================
