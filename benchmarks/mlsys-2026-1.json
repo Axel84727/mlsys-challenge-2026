@@ -17,7 +17,7 @@
   ],
   "base_costs": [2000, 500, 2000, 2000, 500],
   "op_types": ["MatMul", "Pointwise", "MatMul", "MatMul", "Pointwise"],
-  "fast_memory_capacity": 60000, 
+  "fast_memory_capacity": 60000,
   "slow_memory_bandwidth": 20,
   "native_granularity": [128, 128]
 }

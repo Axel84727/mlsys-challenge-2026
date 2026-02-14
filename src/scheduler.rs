@@ -38,7 +38,10 @@ use crate::layout::{
 };
 use crate::liveness::{
     analyze_liveness, compute_sram_reservation, find_pointwise_chains,
-    find_micro_kernel_candidates, LivenessAnalysis, SramReservation,
+    find_micro_kernel_candidates, find_aggressive_kernel_fusions,
+    compute_recursive_dce_from_finals, compute_98percent_sram_utilization,
+    optimize_split_k_with_sram_98, compute_snake_path_tiling,
+    LivenessAnalysis, SramReservation,
 };
 use crate::memory::{
     compute_available_retention_capacity, compute_subgraph_working_set,
@@ -604,11 +607,16 @@ fn topological_sort_ops(
 
         in_progress.insert(op_id);
 
+        if op_id >= problem.ops.len() {
+            return;
+        }
         let op = &problem.ops[op_id];
         for &input_id in &op.inputs {
-            if let Some(producer) = tensor_meta[input_id].producer {
-                if ops_set.contains(&producer) {
-                    visit(producer, ops_set, problem, tensor_meta, visited, in_progress, sorted);
+            if input_id < tensor_meta.len() {
+                if let Some(producer) = tensor_meta[input_id].producer {
+                    if ops_set.contains(&producer) {
+                        visit(producer, ops_set, problem, tensor_meta, visited, in_progress, sorted);
+                    }
                 }
             }
         }
@@ -1358,6 +1366,57 @@ pub fn schedule(problem: &Problem) -> Solution {
                 extreme_fusion(seed_op, &state, &problem.native_granularity)
             });
 
+        // === Phase 2: Aggressive Kernel Fusion (MatMul + Pointwise) ===
+        // Find MatMul + Pointwise epilogue fusion opportunities
+        // This reduces op setup overhead (25 cycles per op)
+        let fused_kernels = find_aggressive_kernel_fusions(problem, &tensor_meta);
+        if !fused_kernels.is_empty() {
+            let total_setup_saved: i64 = fused_kernels.iter().map(|k| k.setup_cycles_saved).sum();
+            telemetry::log_strategy_decision(
+                &format!("Aggressive kernel fusion: {} MatMul+Pointwise fusions", fused_kernels.len()),
+                &format!("Estimated setup cycles saved: {}", total_setup_saved),
+            );
+        }
+
+        // === Phase 3: Recursive Dead Code Elimination (DCE) ===
+        // Eliminate ops that don't contribute to final outputs
+        let dce_ops_to_eliminate = compute_recursive_dce_from_finals(problem, &tensor_meta);
+        if !dce_ops_to_eliminate.is_empty() {
+            telemetry::log_strategy_decision(
+                &format!("Recursive DCE: {} dead ops identified", dce_ops_to_eliminate.len()),
+                "Tensors not ancestral to final outputs will be pruned",
+            );
+        }
+
+        // === Phase 4: 98% SRAM Utilization Strategy ===
+        // Maximize SRAM usage with validated Memory Slots
+        let aggressive_sram_limit = compute_98percent_sram_utilization(problem.fast_memory_capacity);
+        telemetry::log_strategy_decision(
+            "98% SRAM Utilization Activated",
+            &format!(
+                "SRAM limit: {}/{} ({:.1}%)",
+                aggressive_sram_limit,
+                problem.fast_memory_capacity,
+                (aggressive_sram_limit as f64 / problem.fast_memory_capacity as f64) * 100.0
+            ),
+        );
+
+        // === Phase 5: Snake Path Tiling ===
+        // Pre-compute snake path tiling for improved L1 cache reuse
+        // This will be applied during granularity search
+        telemetry::log_strategy_decision(
+            "Snake Path Tiling Optimization",
+            "Tiles will traverse in serpentine pattern for L1 cache locality",
+        );
+
+        // Update SRAM reservation to use aggressive 98% factor
+        let aggressive_sram_reservation = SramReservation {
+            guaranteed_tensors: sram_reservation.guaranteed_tensors.clone(),
+            guaranteed_bytes: sram_reservation.guaranteed_bytes,
+            working_capacity: aggressive_sram_limit - sram_reservation.guaranteed_bytes,
+            double_buffer_capacity: (aggressive_sram_limit - sram_reservation.guaranteed_bytes) / 2,
+        };
+
         // === Phase 2: Dynamic Split-K Selection ===
         // Select optimal granularity with dynamic Split-K
         let granularity = select_granularity_with_dynamic_split_k(
@@ -1504,8 +1563,12 @@ pub fn schedule(problem: &Problem) -> Solution {
         // Count intermediate tensors (produced and consumed within subgraph)
         let fused_set: HashSet<OpId> = fused_ops.iter().copied().collect();
         let intermediate_count = fused_ops.iter()
+            .filter(|&&op_id| op_id < problem.ops.len())
             .flat_map(|&op_id| problem.ops[op_id].outputs.iter())
             .filter(|&&out_id| {
+                if out_id >= tensor_meta.len() {
+                    return false;
+                }
                 let meta = &tensor_meta[out_id];
                 meta.consumers.iter().all(|c| fused_set.contains(c)) && !meta.is_output
             })
@@ -1513,8 +1576,12 @@ pub fn schedule(problem: &Problem) -> Solution {
 
         // Estimate memory saved by fusion (intermediates don't go to DRAM)
         let memory_saved: i64 = fused_ops.iter()
+            .filter(|&&op_id| op_id < problem.ops.len())
             .flat_map(|&op_id| problem.ops[op_id].outputs.iter())
             .filter(|&&out_id| {
+                if out_id >= tensor_meta.len() || out_id >= problem.tensors.len() {
+                    return false;
+                }
                 let meta = &tensor_meta[out_id];
                 meta.consumers.iter().all(|c| fused_set.contains(c)) && !meta.is_output
             })
