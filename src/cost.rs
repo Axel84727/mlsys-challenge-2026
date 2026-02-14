@@ -267,8 +267,14 @@ pub fn compute_subgraph_compute_cost_with_bonus(
 
     // Calculate base costs first
     for &op_id in ops {
+        if op_id >= problem.ops.len() {
+            continue;
+        }
         let op = &problem.ops[op_id];
         if let Some(&output_id) = op.outputs.first() {
+            if output_id >= problem.tensors.len() {
+                continue;
+            }
             let output_tensor = &problem.tensors[output_id];
             let input_tensors: Vec<&Tensor> = op.inputs.iter()
                 .filter_map(|&id| problem.tensors.get(id))
@@ -347,8 +353,14 @@ fn compute_intermediate_elimination_bonus_adaptive(ops: &[OpId], problem: &Probl
     let mut intermediate_tensors = 0;
 
     for &op_id in ops {
+        if op_id >= problem.ops.len() {
+            continue;
+        }
         let op = &problem.ops[op_id];
         for &output_id in &op.outputs {
+            if output_id >= tensor_meta.len() {
+                continue;
+            }
             total_tensors += 1;
 
             // Check if all consumers are within the subgraph
@@ -409,8 +421,13 @@ fn compute_generic_fusion_bonus(ops: &[OpId], problem: &Problem) -> f64 {
     let mut total_transitions = 0;
 
     for i in 0..ops.len().saturating_sub(1) {
-        let current_op = &problem.ops[ops[i]];
-        let next_op = &problem.ops[ops[i + 1]];
+        let op_id1 = ops[i];
+        let op_id2 = ops[i + 1];
+        if op_id1 >= problem.ops.len() || op_id2 >= problem.ops.len() {
+            continue;
+        }
+        let current_op = &problem.ops[op_id1];
+        let next_op = &problem.ops[op_id2];
         total_transitions += 1;
 
         // Check if there's a data dependency (fusion opportunity)
@@ -510,9 +527,12 @@ pub fn compute_memory_transfer_cost(
 
     // Calculate reads (external inputs not already resident)
     for &op_id in ops {
+        if op_id >= problem.ops.len() {
+            continue;
+        }
         let op = &problem.ops[op_id];
         for &input_id in &op.inputs {
-            if counted_inputs.contains(&input_id) {
+            if counted_inputs.contains(&input_id) || input_id >= tensor_meta.len() || input_id >= problem.tensors.len() {
                 continue;
             }
             counted_inputs.insert(input_id);
@@ -538,8 +558,14 @@ pub fn compute_memory_transfer_cost(
 
     // Calculate writes (external outputs)
     for &op_id in ops {
+        if op_id >= problem.ops.len() {
+            continue;
+        }
         let op = &problem.ops[op_id];
         for &output_id in &op.outputs {
+            if output_id >= tensor_meta.len() || output_id >= problem.tensors.len() {
+                continue;
+            }
             let meta = &tensor_meta[output_id];
             let has_external_consumer = meta.consumers.iter().any(|c| !ops_set.contains(c));
             let is_graph_output = meta.is_output;
@@ -576,8 +602,20 @@ pub fn compute_memory_transfer_cost(
 
     // Check if we're dealing with large tensors (benefit more from aggressive prefetch)
     let max_tensor_size: i64 = ops.iter()
-        .flat_map(|&op_id| problem.ops[op_id].outputs.iter())
-        .map(|&out_id| problem.tensors[out_id].size())
+        .filter_map(|&op_id| {
+            if op_id >= problem.ops.len() {
+                return None;
+            }
+            problem.ops[op_id].outputs.iter()
+                .filter_map(|&out_id| {
+                    if out_id < problem.tensors.len() {
+                        Some(problem.tensors[out_id].size())
+                    } else {
+                        None
+                    }
+                })
+                .max()
+        })
         .max()
         .unwrap_or(0);
     let is_large_tensor_workload = max_tensor_size >= LARGE_TENSOR_THRESHOLD;

@@ -111,6 +111,9 @@ pub fn compute_subgraph_working_set(
 
         // Check inputs
         for &input_id in &op.inputs {
+            if input_id >= tensor_meta.len() {
+                continue;
+            }
             let meta = &tensor_meta[input_id];
             // External if producer is outside subgraph or it's a graph input
             if meta.producer.is_none_or(|p| !ops_set.contains(&p)) {
@@ -120,6 +123,9 @@ pub fn compute_subgraph_working_set(
 
         // Check outputs
         for &output_id in &op.outputs {
+            if output_id >= tensor_meta.len() {
+                continue;
+            }
             let meta = &tensor_meta[output_id];
             // Check if any consumer is outside the subgraph
             let has_external_consumer = meta.consumers.iter().any(|c| !ops_set.contains(c));
@@ -438,6 +444,9 @@ pub fn analyze_tensor_residency(
     let mut candidates: Vec<(TensorId, i64, usize, i64)> = Vec::new();
 
     for &tensor_id in current_subgraph_outputs {
+        if tensor_id >= tensor_meta.len() || tensor_id >= problem.tensors.len() {
+            continue;
+        }
         let meta = &tensor_meta[tensor_id];
         let tensor_size = problem.tensors[tensor_id].size();
 

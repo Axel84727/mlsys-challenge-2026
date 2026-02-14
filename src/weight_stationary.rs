@@ -297,6 +297,11 @@ pub fn enhance_retention_with_weights(
             continue;
         }
 
+        // Skip if tensor_id is out of bounds
+        if tensor_id >= weight_analysis.tensor_info.len() || tensor_id >= tensor_meta.len() {
+            continue;
+        }
+
         let info = &weight_analysis.tensor_info[tensor_id];
         let meta = &tensor_meta[tensor_id];
 
