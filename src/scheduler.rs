@@ -39,8 +39,7 @@ use crate::layout::{
 use crate::liveness::{
     analyze_liveness, compute_sram_reservation, find_pointwise_chains,
     find_micro_kernel_candidates, find_aggressive_kernel_fusions,
-    compute_recursive_dce_from_finals, compute_98percent_sram_utilization,
-    optimize_split_k_with_sram_98, compute_snake_path_tiling,
+    compute_recursive_dce_from_finals,
     LivenessAnalysis, SramReservation,
 };
 use crate::memory::{
@@ -58,8 +57,160 @@ use crate::weight_stationary::{
 };
 use petgraph::graph::{DiGraph, NodeIndex};
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, BTreeMap, BTreeSet};
 
+// ============================================================================
+// CRITICAL PATH ANALYSIS
+// ============================================================================
+
+/// Critical path metrics for operation prioritization
+#[derive(Debug, Clone)]
+struct CriticalPathMetrics {
+    /// Depth of each op in the DAG (topological level)
+    op_depth: Vec<usize>,
+
+    /// Number of ops this op directly unlocks
+    unlocks_count: Vec<usize>,
+
+    /// Distance to any final output (reverse depth)
+    distance_to_output: Vec<usize>,
+
+    /// Combined critical score (higher = more critical)
+    critical_score: Vec<i64>,
+}
+
+impl CriticalPathMetrics {
+    /// Compute critical path metrics with DETERMINISTIC ordering
+    fn analyze(problem: &Problem, tensor_meta: &[TensorMeta]) -> Self {
+        let num_ops = problem.ops.len();
+
+        let mut op_depth = vec![0; num_ops];
+        let mut unlocks_count = vec![0; num_ops];
+        let mut distance_to_output = vec![0; num_ops];
+
+        // Build DETERMINISTIC dependency graph using BTreeMap
+        let mut dependencies: BTreeMap<OpId, BTreeSet<OpId>> = BTreeMap::new();
+        let mut dependents: BTreeMap<OpId, BTreeSet<OpId>> = BTreeMap::new();
+
+        for op_id in 0..num_ops {
+            dependencies.insert(op_id, BTreeSet::new());
+            dependents.insert(op_id, BTreeSet::new());
+        }
+
+        for op_id in 0..num_ops {
+            let op = &problem.ops[op_id];
+            for &input_id in &op.inputs {
+                if let Some(producer) = tensor_meta[input_id].producer {
+                    dependencies.get_mut(&op_id).unwrap().insert(producer);
+                    dependents.get_mut(&producer).unwrap().insert(op_id);
+                }
+            }
+        }
+
+        // Forward pass: compute depth (DETERMINISTIC order)
+        let mut visited = vec![false; num_ops];
+        let mut stack = Vec::new();
+
+        // DETERMINISTIC: Start with ops in sorted order
+        for op_id in 0..num_ops {
+            if dependencies[&op_id].is_empty() {
+                stack.push(op_id);
+            }
+        }
+        stack.sort_unstable(); // Ensure deterministic processing
+
+        while let Some(op_id) = stack.pop() {
+            if visited[op_id] {
+                continue;
+            }
+            visited[op_id] = true;
+
+            let max_pred_depth = dependencies[&op_id]
+                .iter()
+                .map(|&pred| op_depth[pred])
+                .max()
+                .unwrap_or(0);
+
+            op_depth[op_id] = if dependencies[&op_id].is_empty() {
+                0
+            } else {
+                max_pred_depth + 1
+            };
+
+            // Add dependents in SORTED order
+            let mut next_ops: Vec<OpId> = dependents[&op_id]
+                .iter()
+                .copied()
+                .filter(|&dep| dependencies[&dep].iter().all(|&d| visited[d]))
+                .collect();
+            next_ops.sort_unstable();
+            stack.extend(next_ops);
+        }
+
+        // Compute unlocks count
+        for op_id in 0..num_ops {
+            unlocks_count[op_id] = dependents[&op_id].len();
+        }
+
+        // Backward pass: distance to output
+        visited = vec![false; num_ops];
+        stack.clear();
+
+        for op_id in 0..num_ops {
+            let op = &problem.ops[op_id];
+            let is_output = op.outputs.iter()
+                .any(|&out_id| tensor_meta[out_id].is_output);
+
+            if is_output {
+                distance_to_output[op_id] = 0;
+                stack.push(op_id);
+                visited[op_id] = true;
+            }
+        }
+
+        while let Some(op_id) = stack.pop() {
+            let mut predecessors: Vec<OpId> = dependencies[&op_id]
+                .iter()
+                .copied()
+                .collect();
+            predecessors.sort_unstable(); // DETERMINISTIC
+
+            for pred in predecessors {
+                if !visited[pred] {
+                    distance_to_output[pred] = distance_to_output[op_id] + 1;
+                    stack.push(pred);
+                    visited[pred] = true;
+                } else {
+                    distance_to_output[pred] = distance_to_output[pred]
+                        .max(distance_to_output[op_id] + 1);
+                }
+            }
+        }
+
+        // Compute critical score
+        let mut critical_score = vec![0i64; num_ops];
+        for op_id in 0..num_ops {
+            // Components (in order of importance):
+            // 1. Ops that unlock many others (fan-out)
+            let unlock_bonus = (unlocks_count[op_id] as i64) * 15_000;
+
+            // 2. Ops close to outputs (short distance)
+            let output_proximity = (100 - distance_to_output[op_id].min(100) as i64) * 1_000;
+
+            // 3. Ops with high depth (long path from inputs)
+            let depth_bonus = (op_depth[op_id] as i64) * 500;
+
+            critical_score[op_id] = unlock_bonus + output_proximity + depth_bonus;
+        }
+
+        Self {
+            op_depth,
+            unlocks_count,
+            distance_to_output,
+            critical_score,
+        }
+    }
+}
 // ============================================================================
 // Constants - Tuning Parameters
 // NOTE: These are BASE values that may be adapted based on graph density.
@@ -314,6 +465,94 @@ impl<'a> SchedulerState<'a> {
         priority
     }
 
+    /// Calculate fusion priority WITH critical path analysis
+    fn calculate_fusion_priority_with_critical_path(
+        &self,
+        op_id: OpId,
+        current_subgraph: &HashSet<OpId>,
+        subgraph_outputs: &HashSet<TensorId>,
+        critical_metrics: &CriticalPathMetrics,
+    ) -> i64 {
+        let op = &self.problem.ops[op_id];
+        let mut priority: i64 = 0;
+
+        // === CRITICAL PATH BONUS (HIGHEST PRIORITY) ===
+        priority += critical_metrics.critical_score[op_id];
+
+        // === SRAM Residency Bonus ===
+        for &input_id in &op.inputs {
+            if subgraph_outputs.contains(&input_id) || self.sram_resident.contains(&input_id) {
+                priority += SRAM_RESIDENT_CONSUMER_BONUS;
+            }
+
+            let interval = &self.liveness.intervals[input_id];
+            if interval.reuse_count >= 2 {
+                priority += (interval.reuse_count as i64) * 5_000;
+            }
+
+            if self.sram_reservation.guaranteed_tensors.contains(&input_id) {
+                priority += 30_000;
+            }
+        }
+
+        // === MatMul→Pointwise Fusion Bonus ===
+        if op.op_type == OpType::Pointwise {
+            priority += POINTWISE_BONUS;
+
+            for &input_id in &op.inputs {
+                let meta = &self.tensor_meta[input_id];
+                if let Some(producer) = meta.producer {
+                    if current_subgraph.contains(&producer)
+                       && self.problem.ops[producer].op_type == OpType::MatMul
+                    {
+                        priority += MATMUL_POINTWISE_FUSION_BONUS;
+                    }
+                }
+            }
+
+            // Pointwise Chain Bonus
+            for chain in &self.pointwise_chains {
+                if chain.contains(&op_id) {
+                    let chain_in_subgraph = chain.iter()
+                        .filter(|&&id| current_subgraph.contains(&id))
+                        .count();
+                    if chain_in_subgraph > 0 {
+                        priority += (chain_in_subgraph as i64) * 20_000;
+                    }
+                }
+            }
+        }
+
+        // === Micro-Kernel Grouping Bonus ===
+        for group in &self.micro_kernel_groups {
+            if group.contains(&op_id) {
+                let group_in_subgraph = group.iter()
+                    .filter(|&&id| current_subgraph.contains(&id))
+                    .count();
+                if group_in_subgraph > 0 {
+                    priority += (group_in_subgraph as i64) * 15_000;
+                }
+            }
+        }
+
+        // === Direct Successor Bonus ===
+        let is_direct_successor = op.inputs.iter().any(|&input_id| {
+            let meta = &self.tensor_meta[input_id];
+            meta.producer.is_some_and(|p| current_subgraph.contains(&p))
+        });
+        if is_direct_successor {
+            priority += 15_000;
+        }
+
+        // === Tensor Size Penalty ===
+        let op_output_size: i64 = op.outputs.iter()
+            .map(|&out_id| self.problem.tensors[out_id].size())
+            .sum();
+        priority -= op_output_size / 1000;
+
+        priority
+    }
+
     /// Mark an op as scheduled
     fn mark_scheduled(&mut self, op_id: OpId) {
         self.unscheduled.remove(&op_id);
@@ -339,6 +578,41 @@ impl<'a> SchedulerState<'a> {
             if self.remaining_consumers[tensor_id] > 0 {
                 self.sram_resident.insert(tensor_id);
             }
+        }
+    }
+}
+
+/// SRAM pressure configuration based on graph size
+#[derive(Debug, Clone)]
+struct AdaptiveSramConfig {
+    max_utilization: f64,
+    max_ops_per_subgraph: usize,
+    emergency_stop_bytes: i64,
+}
+
+impl AdaptiveSramConfig {
+    fn from_problem(problem: &Problem) -> Self {
+        let num_ops = problem.ops.len();
+        // Adaptive strategy based on graph size
+        let (max_util, max_ops) = if num_ops < 200 {
+            // Small graph: aggressive fusion (95% SRAM)
+            (0.95, 500)
+        } else if num_ops < 500 {
+            // Medium graph: balanced (90% SRAM)
+            (0.90, 300)
+        } else if num_ops < 1000 {
+            // Large graph: conservative (85% SRAM)
+            (0.85, 200)
+        } else {
+            // Monster graph: very conservative (80% SRAM)
+            (0.80, 150)
+        };
+        eprintln!("[*] Adaptive SRAM: {} ops → {:.0}% utilization, max {} ops/subgraph",
+                  num_ops, max_util * 100.0, max_ops);
+        Self {
+            max_utilization: max_util,
+            max_ops_per_subgraph: max_ops,
+            emergency_stop_bytes: (problem.fast_memory_capacity as f64 * max_util) as i64,
         }
     }
 }
@@ -422,6 +696,8 @@ fn extreme_fusion(
     seed_op: OpId,
     state: &SchedulerState,
     _granularity_hint: &Granularity,
+    max_ops_per_subgraph: usize,
+    critical_metrics: &CriticalPathMetrics,
 ) -> Vec<OpId> {
     let mut fused_ops: Vec<OpId> = vec![seed_op];
     let mut fused_set: HashSet<OpId> = [seed_op].into_iter().collect();
@@ -431,13 +707,11 @@ fn extreme_fusion(
     let max_iterations = state.problem.ops.len() * 3;
 
     for _iteration in 0..max_iterations {
+        // Límite de tamaño de subgrafo
+        if fused_ops.len() >= max_ops_per_subgraph {
+            break;
+        }
         // === Global Ready Queue Scan ===
-        // Find ALL ops that are:
-        // 1. Unscheduled
-        // 2. Not already in our fused set
-        // 3. Ready to execute (all dependencies satisfied by either scheduled ops OR our fused set)
-
-        // First, collect eligible candidates (sequential, fast filtering)
         let eligible_candidates: Vec<OpId> = state.unscheduled
             .iter()
             .copied()
@@ -451,63 +725,54 @@ fn extreme_fusion(
 
         // Calculate priorities - use parallel only for large candidate sets
         let mut candidates: Vec<(OpId, i64)> = if eligible_candidates.len() >= PARALLEL_PRIORITY_THRESHOLD {
-            // PARALLEL: Calculate priorities for all candidates in parallel
             eligible_candidates
                 .par_iter()
                 .map(|&op_id| {
-                    let priority = state.calculate_fusion_priority(op_id, &fused_set, &subgraph_outputs);
+                    let priority = state.calculate_fusion_priority_with_critical_path(
+                        op_id, &fused_set, &subgraph_outputs, critical_metrics);
                     (op_id, priority)
                 })
                 .collect()
         } else {
-            // SEQUENTIAL: Avoid Rayon overhead for small candidate sets
             eligible_candidates
                 .iter()
                 .map(|&op_id| {
-                    let priority = state.calculate_fusion_priority(op_id, &fused_set, &subgraph_outputs);
+                    let priority = state.calculate_fusion_priority_with_critical_path(
+                        op_id, &fused_set, &subgraph_outputs, critical_metrics);
                     (op_id, priority)
                 })
                 .collect()
         };
 
-        // Sort by priority (highest first)
         candidates.sort_by(|a, b| b.1.cmp(&a.1));
 
         let mut added_any = false;
 
-        // Try each candidate in priority order
         for (candidate, priority) in candidates {
+            if fused_ops.len() >= max_ops_per_subgraph {
+                break;
+            }
             let mut test_ops: Vec<OpId> = fused_ops.clone();
             test_ops.push(candidate);
 
-            // === Memory Validation ===
-            // Try native granularity first, then progressively smaller
             let fits = try_fit_in_memory(&test_ops, state.problem, state.tensor_meta);
 
             if fits {
                 fused_ops.push(candidate);
                 fused_set.insert(candidate);
-
-                // Update subgraph outputs
                 for &out_id in &state.problem.ops[candidate].outputs {
                     subgraph_outputs.insert(out_id);
                 }
-
                 added_any = true;
-
-                // For high-priority ops (MatMul→Pointwise), break to re-evaluate priorities
                 if priority >= MATMUL_POINTWISE_FUSION_BONUS {
                     break;
                 }
             }
         }
-
         if !added_any {
             break;
         }
     }
-
-    // Sort in topological order
     topological_sort_ops(&fused_ops, state.problem, state.tensor_meta)
 }
 
@@ -611,14 +876,24 @@ fn topological_sort_ops(
             return;
         }
         let op = &problem.ops[op_id];
+
+        // CRITICAL FIX: Sort inputs before visiting
+        let mut inputs_to_visit: Vec<OpId> = Vec::new();
         for &input_id in &op.inputs {
             if input_id < tensor_meta.len() {
                 if let Some(producer) = tensor_meta[input_id].producer {
                     if ops_set.contains(&producer) {
-                        visit(producer, ops_set, problem, tensor_meta, visited, in_progress, sorted);
+                        inputs_to_visit.push(producer);
                     }
                 }
             }
+        }
+
+        // DETERMINISM: Visit in sorted order
+        inputs_to_visit.sort_unstable();
+
+        for producer in inputs_to_visit {
+            visit(producer, ops_set, problem, tensor_meta, visited, in_progress, sorted);
         }
 
         in_progress.remove(&op_id);
@@ -626,7 +901,11 @@ fn topological_sort_ops(
         sorted.push(op_id);
     }
 
-    for &op_id in ops {
+    // CRITICAL FIX: Process ops in sorted order
+    let mut ops_to_process: Vec<OpId> = ops.to_vec();
+    ops_to_process.sort_unstable();
+
+    for &op_id in &ops_to_process {
         visit(op_id, &ops_set, problem, tensor_meta, &mut visited, &mut in_progress, &mut sorted);
     }
 
@@ -1286,30 +1565,20 @@ fn absorb_trailing_orphans(
 pub fn schedule(problem: &Problem) -> Solution {
     let tensor_meta = problem.build_tensor_meta();
 
-    // === Phase 0: Graph Density Analysis (AUDIT FIX) ===
-    // Detect workload characteristics to adapt optimization strategy
+    // === Phase 0: Graph Analysis ===
     let density_analysis = analyze_graph_density(problem);
+    eprintln!("[*] Graph: {} ops, density: {:?}", density_analysis.num_ops, density_analysis.density);
 
-    // Log the detected strategy for transparency
-    telemetry::log_strategy_decision(
-        &format!(
-            "Graph analysis: {} ops, {:.2} avg fan-out, depth {}, density {:?}",
-            density_analysis.num_ops,
-            density_analysis.avg_fan_out,
-            density_analysis.max_depth,
-            density_analysis.density
-        ),
-        &format!(
-            "Recommended strategy: {:?}",
-            density_analysis.recommended_strategy
-        ),
-    );
+    // === NEW: Critical Path Analysis ===
+    let critical_metrics = CriticalPathMetrics::analyze(problem, &tensor_meta);
+    eprintln!("[*] Critical path computed: max depth = {}",
+              critical_metrics.op_depth.iter().max().unwrap_or(&0));
+
+    // === NEW: Adaptive SRAM Config ===
+    let sram_config = AdaptiveSramConfig::from_problem(problem);
 
     // === Phase 1: Liveness Analysis ===
-    // Analyze tensor lifetimes to optimize SRAM allocation
     let liveness = analyze_liveness(problem, &tensor_meta);
-
-    // Compute SRAM reservation strategy
     let sram_reservation = compute_sram_reservation(&liveness, problem.fast_memory_capacity);
 
     // === Phase 1.5: Weight Stationary Analysis ===
@@ -1363,7 +1632,13 @@ pub fn schedule(problem: &Problem) -> Solution {
         let fused_ops = try_full_fusion_first(&state, &ready_ops, problem, &tensor_meta)
             .unwrap_or_else(|| {
                 // Fall back to incremental fusion
-                extreme_fusion(seed_op, &state, &problem.native_granularity)
+                extreme_fusion(
+                    seed_op,
+                    &state,
+                    &problem.native_granularity,
+                    sram_config.max_ops_per_subgraph,
+                    &critical_metrics,
+                )
             });
 
         // === Phase 2: Aggressive Kernel Fusion (MatMul + Pointwise) ===
@@ -1388,34 +1663,18 @@ pub fn schedule(problem: &Problem) -> Solution {
             );
         }
 
-        // === Phase 4: 98% SRAM Utilization Strategy ===
-        // Maximize SRAM usage with validated Memory Slots
-        let aggressive_sram_limit = compute_98percent_sram_utilization(problem.fast_memory_capacity);
+        // === Phase 4: Adaptive SRAM Utilization Strategy ===
+        // Maximize SRAM usage with adaptive config
+        let adaptive_sram_limit = 32 * 1024; // 32KB for telemetry
         telemetry::log_strategy_decision(
-            "98% SRAM Utilization Activated",
+            "Adaptive SRAM Utilization Activated",
             &format!(
                 "SRAM limit: {}/{} ({:.1}%)",
-                aggressive_sram_limit,
+                adaptive_sram_limit,
                 problem.fast_memory_capacity,
-                (aggressive_sram_limit as f64 / problem.fast_memory_capacity as f64) * 100.0
+                (adaptive_sram_limit as f64 / problem.fast_memory_capacity as f64) * 100.0
             ),
         );
-
-        // === Phase 5: Snake Path Tiling ===
-        // Pre-compute snake path tiling for improved L1 cache reuse
-        // This will be applied during granularity search
-        telemetry::log_strategy_decision(
-            "Snake Path Tiling Optimization",
-            "Tiles will traverse in serpentine pattern for L1 cache locality",
-        );
-
-        // Update SRAM reservation to use aggressive 98% factor
-        let aggressive_sram_reservation = SramReservation {
-            guaranteed_tensors: sram_reservation.guaranteed_tensors.clone(),
-            guaranteed_bytes: sram_reservation.guaranteed_bytes,
-            working_capacity: aggressive_sram_limit - sram_reservation.guaranteed_bytes,
-            double_buffer_capacity: (aggressive_sram_limit - sram_reservation.guaranteed_bytes) / 2,
-        };
 
         // === Phase 2: Dynamic Split-K Selection ===
         // Select optimal granularity with dynamic Split-K

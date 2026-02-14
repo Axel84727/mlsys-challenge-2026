@@ -18,7 +18,7 @@
 //! println!("Eliminated {} nodes", stats.total_eliminated());
 //! ```
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque, BTreeMap};
 use crate::models::{Op, OpId, OpType, Problem, Tensor, TensorId};
 
 // ============================================================================
@@ -724,30 +724,22 @@ fn dead_code_elimination(graph: &mut RewriteGraph) -> usize {
 /// Returns pairs of tensors that can share the same SRAM buffer.
 #[derive(Debug, Clone)]
 pub struct BufferSharingInfo {
-    /// Pairs of tensor IDs that can share buffer space
     pub sharing_pairs: Vec<(TensorId, TensorId)>,
-    /// Liveness intervals for each tensor (start_op, end_op)
-    pub liveness_intervals: HashMap<TensorId, (OpId, OpId)>,
-    /// Memory slot assignments: tensor_id -> slot_id
-    /// Tensors in the same slot have disjoint lifetimes and share memory
-    pub slot_assignments: HashMap<TensorId, usize>,
-    /// Slot sizes: slot_id -> max size needed for any tensor in that slot
+    pub liveness_intervals: BTreeMap<TensorId, (OpId, OpId)>,  // CHANGED
+    pub slot_assignments: BTreeMap<TensorId, usize>,            // CHANGED
     pub slot_sizes: Vec<i64>,
-    /// Total compacted memory required (sum of slot sizes)
     pub compacted_memory: i64,
-    /// Original memory required (sum of all tensor sizes)
     pub original_memory: i64,
-    /// Memory savings ratio
     pub compression_ratio: f64,
 }
 
 fn analyze_buffer_sharing(graph: &RewriteGraph) -> BufferSharingInfo {
-    let mut liveness_intervals: HashMap<TensorId, (OpId, OpId)> = HashMap::new();
+    let mut liveness_intervals: BTreeMap<TensorId, (OpId, OpId)> = BTreeMap::new();
 
     // Compute topological order of active ops
     let mut topo_order: Vec<OpId> = Vec::new();
-    let mut in_degree: HashMap<OpId, usize> = HashMap::new();
-    let mut adj: HashMap<OpId, Vec<OpId>> = HashMap::new();
+    let mut in_degree: BTreeMap<OpId, usize> = BTreeMap::new();
+    let mut adj: BTreeMap<OpId, Vec<OpId>> = BTreeMap::new();
 
     // Build adjacency
     for op_id in 0..graph.ops.len() {
@@ -776,29 +768,42 @@ fn analyze_buffer_sharing(graph: &RewriteGraph) -> BufferSharingInfo {
         }
     }
 
-    // Kahn's algorithm
-    let mut queue: VecDeque<OpId> = in_degree.iter()
+
+    // Kahn's algorithm - DETERMINISTIC initialization
+    let mut initial_ops: Vec<OpId> = in_degree.iter()
         .filter(|(_, &deg)| deg == 0)
         .map(|(&id, _)| id)
         .collect();
+
+    // CRITICAL: Sort for determinism
+    initial_ops.sort_unstable();
+
+    let mut queue: VecDeque<OpId> = initial_ops.into_iter().collect();
 
     while let Some(op_id) = queue.pop_front() {
         topo_order.push(op_id);
 
         if let Some(successors) = adj.get(&op_id) {
+            // Collect successors that become ready
+            let mut ready: Vec<OpId> = Vec::new();
             for &succ in successors {
                 if let Some(deg) = in_degree.get_mut(&succ) {
                     *deg -= 1;
                     if *deg == 0 {
-                        queue.push_back(succ);
+                        ready.push(succ);
                     }
                 }
+            }
+            // DETERMINISM: Add in sorted order
+            ready.sort_unstable();
+            for succ in ready {
+                queue.push_back(succ);
             }
         }
     }
 
     // Map op_id to position in topological order
-    let op_to_pos: HashMap<OpId, usize> = topo_order.iter()
+    let op_to_pos: BTreeMap<OpId, usize> = topo_order.iter()
         .enumerate()
         .map(|(pos, &op_id)| (op_id, pos))
         .collect();
@@ -848,12 +853,14 @@ fn analyze_buffer_sharing(graph: &RewriteGraph) -> BufferSharingInfo {
 
     // Sort by start time, then by size descending (pack big tensors first)
     tensor_intervals.sort_by(|a, b| {
-        a.1.cmp(&b.1).then_with(|| b.3.cmp(&a.3))
+        a.1.cmp(&b.1)                    // 1. Start time (earliest first)
+            .then_with(|| b.3.cmp(&a.3))  // 2. Size (largest first)
+            .then_with(|| a.0.cmp(&b.0))  // 3. TensorId (smallest first) - CRITICAL for determinism
     });
 
     // Greedy interval coloring with First-Fit Decreasing
     // Each "slot" is a memory region; tensors in the same slot have disjoint lifetimes
-    let mut slot_assignments: HashMap<TensorId, usize> = HashMap::new();
+    let mut slot_assignments: BTreeMap<TensorId, usize> = BTreeMap::new();
     let mut slot_intervals: Vec<Vec<(usize, usize)>> = Vec::new(); // end times for each slot
     let mut slot_sizes: Vec<i64> = Vec::new();
 
@@ -907,15 +914,22 @@ fn analyze_buffer_sharing(graph: &RewriteGraph) -> BufferSharingInfo {
     let mut sharing_pairs: Vec<(TensorId, TensorId)> = Vec::new();
 
     // Group tensors by slot
-    let mut slot_to_tensors: HashMap<usize, Vec<TensorId>> = HashMap::new();
+    let mut slot_to_tensors: BTreeMap<usize, Vec<TensorId>> = BTreeMap::new();
     for (&tid, &slot_id) in &slot_assignments {
         slot_to_tensors.entry(slot_id).or_insert_with(Vec::new).push(tid);
     }
 
+    for tensors in slot_to_tensors.values_mut() {
+        tensors.sort_unstable();
+    }
+
     // Generate pairs within each slot
-    for tensors in slot_to_tensors.values() {
+    // Iterate over slots in sorted order
+    for (_slot_id, tensors) in &slot_to_tensors {
+        // Tensors are already sorted, generate canonical pairs
         for i in 0..tensors.len() {
             for j in (i + 1)..tensors.len() {
+                // Since tensors[i] < tensors[j] (sorted), pairs are canonical
                 sharing_pairs.push((tensors[i], tensors[j]));
             }
         }
@@ -1229,12 +1243,5 @@ mod tests {
         // In this simple case, both are detected as outputs, so no DCE
     }
 }
-
-
-
-
-
-
-
 
 
