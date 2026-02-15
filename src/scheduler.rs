@@ -50,7 +50,7 @@ use crate::models::{
     Granularity, GranularityOutput, OpId, OpType, Problem, Solution, Subgraph, SubgraphOutput,
     TensorId, TensorMeta,
 };
-use crate::telemetry;
+use crate::{layout, telemetry};
 use crate::weight_stationary::{
     analyze_weights, WeightAnalysis, WeightStationaryConfig,
     enhance_retention_with_weights, calculate_sticky_reservation,
@@ -633,7 +633,14 @@ fn try_full_fusion_first(
     ready_ops: &[OpId],
     problem: &Problem,
     tensor_meta: &[TensorMeta],
-) -> Option<Vec<OpId>> {
+    use_aggressive_fusion: bool,
+) -> Option<(Vec<OpId>, Granularity)> {  // ← Return granularity too
+    // Skip full fusion for sparse graphs if strategy says no
+    if !use_aggressive_fusion {
+        eprintln!("[*] Skipping full fusion (strategy recommends flexible subgraphs)");
+        return None;
+    }
+
     // Only try full fusion if we have a reasonable number of unscheduled ops
     if state.unscheduled.len() < 2 {
         return None;
@@ -648,17 +655,18 @@ fn try_full_fusion_first(
 
     // Try to fit all ops with various granularities
     // First try without Split-K (best performance)
+    // PRIORITY ORDER: Best configurations first
     let granularity_candidates = [
+        // PRIORITY: Best configurations first
+        Granularity::new(128, 128, 2),  // ← FIRST!
+        Granularity::new(128, 128, 1),
+        Granularity::new(128, 128, 4),
+        Granularity::new(64, 128, 2),
+        Granularity::new(128, 64, 2),
+        Granularity::new(64, 64, 2),
         Granularity::new(64, 128, 1),
         Granularity::new(128, 64, 1),
         Granularity::new(64, 64, 1),
-        Granularity::new(32, 128, 1),
-        Granularity::new(128, 32, 1),
-        // With Split-K for MatMul-heavy workloads
-        Granularity::new(64, 128, 2),
-        Granularity::new(64, 128, 4),
-        Granularity::new(128, 128, 2),
-        Granularity::new(128, 128, 4),
     ];
 
     for granularity in &granularity_candidates {
@@ -671,7 +679,7 @@ fn try_full_fusion_first(
                 granularity.width, granularity.height, granularity.depth,
                 ws.total_size, problem.fast_memory_capacity
             );
-            return Some(all_unscheduled);
+            return Some((all_unscheduled, granularity.clone()));
         }
     }
 
@@ -1159,43 +1167,42 @@ fn select_granularity_with_dynamic_split_k(
     ops: &[OpId],
     problem: &Problem,
     tensor_meta: &[TensorMeta],
-    _sram_reservation: &SramReservation,
+    sram_reservation: &SramReservation,
 ) -> Granularity {
-    // Safety check: empty ops
-    if ops.is_empty() {
-        return problem.native_granularity.clone();
-    }
+    use crate::cost_model::{adaptive_cost_search, CostModelConfig};
+    use crate::layout::{generate_layout_aware_tiling, LayoutAnalysisConfig};
 
-    // First try native granularity without Split-K (best performance)
-    if validate_memory_fit(ops, problem, &problem.native_granularity, tensor_meta) {
-        return problem.native_granularity.clone();
-    }
+    let layout_config = LayoutAnalysisConfig {
+        enabled: true,
+        min_savings: 1000.0,
+        min_improvement_ratio: 0.1,
+        min_confidence: 0.5,
+        max_tensor_size: 100000000,
+    };
 
-    // Check if we have MatMul ops (Split-K only helps MatMul)
-    let has_matmul = ops.iter().any(|&op_id| {
-        op_id < problem.ops.len() && problem.ops[op_id].is_matmul()
-    });
-
-    if has_matmul {
-        // Try progressive Split-K values
-        for k in [2, 4, 8, 16] {
-            let split_gran = problem.native_granularity.with_split_k(k);
-            if validate_memory_fit(ops, problem, &split_gran, tensor_meta) {
-                return split_gran;
-            }
+    if let Some(layout_solution) = generate_layout_aware_tiling(ops, problem, tensor_meta, &layout_config) {
+        let gran = layout_solution.granularity;
+        if validate_memory_fit(ops, problem, &gran, tensor_meta) {
+            eprintln!("    → [LAYOUT OPTIMIZER] {}x{}x{}", gran.width, gran.height, gran.depth);
+            return gran;
         }
     }
 
-    // Fall back to standard selection (reduced spatial granularity)
-    // This always finds something that works
-    select_granularity(ops, problem, tensor_meta)
+    let cost_config = CostModelConfig {
+        max_candidates: 20,
+        fusion_bonus_enabled: true,
+        prefetch_enabled: true,
+        parallel_threshold: 1024,
+    };
+
+    adaptive_cost_search(ops, problem, tensor_meta, &cost_config).best_granularity
 }
 
 /// Analyze tensor residency with liveness-aware prioritization
 ///
 /// PARALLEL: Uses Rayon to calculate retention scores in parallel for large candidate sets.
 /// NOTE: This function is preserved as a fallback. The weight stationary version is preferred.
-#[allow(dead_code)]
+
 fn analyze_tensor_residency_with_liveness(
     candidates: &[TensorId],
     remaining_ops: &[OpId],
@@ -1565,6 +1572,38 @@ fn absorb_trailing_orphans(
 pub fn schedule(problem: &Problem) -> Solution {
     let tensor_meta = problem.build_tensor_meta();
 
+    // === NEW: Graph Density Analysis ===
+    use crate::cost_model::analyze_graph_density;
+    let density_analysis = analyze_graph_density(problem);
+
+    eprintln!("[*] Graph Density Analysis:");
+    eprintln!("    - Operations: {}", density_analysis.num_ops);
+    eprintln!("    - Tensors: {}", density_analysis.num_tensors);
+    eprintln!("    - Avg Fan-out: {:.2}", density_analysis.avg_fan_out);
+    eprintln!("    - Max Depth: {}", density_analysis.max_depth);
+    eprintln!("    - Density: {:?}", density_analysis.density);
+    eprintln!("    - Strategy: {:?}", density_analysis.recommended_strategy);
+
+    // Adapt fusion strategy based on density
+    let use_aggressive_fusion = match density_analysis.recommended_strategy {
+        crate::cost_model::OptimizationStrategy::AggressiveFusion => {
+            eprintln!("    → Using AGGRESSIVE fusion (high density)");
+            true
+        }
+        crate::cost_model::OptimizationStrategy::BalancedFusion => {
+            eprintln!("    → Using BALANCED fusion (medium density)");
+            true
+        }
+        crate::cost_model::OptimizationStrategy::MemoryEfficient => {
+            eprintln!("    → Using MEMORY-EFFICIENT strategy (sparse graph)");
+            false
+        }
+        crate::cost_model::OptimizationStrategy::ChainOptimized => {
+            eprintln!("    → Using CHAIN-OPTIMIZED strategy (deep pipeline)");
+            true
+        }
+    };
+
     // === Phase 0: Graph Analysis ===
     let density_analysis = analyze_graph_density(problem);
     eprintln!("[*] Graph: {} ops, density: {:?}", density_analysis.num_ops, density_analysis.density);
@@ -1628,18 +1667,46 @@ pub fn schedule(problem: &Problem) -> Solution {
         // === OPTIMIZATION: Try fusing ALL remaining ops first ===
         // Key insight: Full fusion often has LESS external I/O than partial fusion
         // because more tensors become intermediate/ephemeral.
+        // === OPTIMIZATION: Try fusing ALL remaining ops first ===
+        // Key insight: Full fusion often has LESS external I/O than partial fusion
+        // because more tensors become intermediate/ephemeral.
         let seed_op = select_best_seed(&ready_ops, &state);
-        let fused_ops = try_full_fusion_first(&state, &ready_ops, problem, &tensor_meta)
+
+        // Try full fusion first
+        let (fused_ops, granularity) = try_full_fusion_first(&state, &ready_ops, problem, &tensor_meta, use_aggressive_fusion)
+            .map(|(ops, gran)| {
+                // Full fusion succeeded - use the granularity it found
+                eprintln!("    [USING] Granularity from full fusion: {}x{}x{}",
+                          gran.width, gran.height, gran.depth);
+                (ops, gran)
+            })
             .unwrap_or_else(|| {
                 // Fall back to incremental fusion
-                extreme_fusion(
+                let ops = extreme_fusion(
                     seed_op,
                     &state,
                     &problem.native_granularity,
                     sram_config.max_ops_per_subgraph,
                     &critical_metrics,
-                )
+                );
+
+                // Select granularity for incremental fusion
+                let gran = select_granularity_with_dynamic_split_k(
+                    &ops, problem, &tensor_meta, &sram_reservation,
+                );
+
+                (ops, gran)
             });
+
+        // === Phase 2: Aggressive Kernel Fusion (MatMul + Pointwise) ===
+        // ... rest of code continues as before ...
+
+        // === Phase 2: Dynamic Split-K Selection ===
+        // REMOVED: No longer call select_granularity_with_dynamic_split_k here!
+        // We already have granularity from above
+
+        // Calculate working set for telemetry
+        let working_set = compute_subgraph_working_set(&fused_ops, problem, &granularity, &tensor_meta);
 
         // === Phase 2: Aggressive Kernel Fusion (MatMul + Pointwise) ===
         // Find MatMul + Pointwise epilogue fusion opportunities
@@ -1676,14 +1743,6 @@ pub fn schedule(problem: &Problem) -> Solution {
             ),
         );
 
-        // === Phase 2: Dynamic Split-K Selection ===
-        // Select optimal granularity with dynamic Split-K
-        let granularity = select_granularity_with_dynamic_split_k(
-            &fused_ops, problem, &tensor_meta, &sram_reservation,
-        );
-
-        // Calculate working set for telemetry
-        let working_set = compute_subgraph_working_set(&fused_ops, problem, &granularity, &tensor_meta);
         let sram_utilization = (working_set.total_size as f64 / problem.fast_memory_capacity as f64) * 100.0;
 
         // Log memory decision
@@ -1798,13 +1857,13 @@ pub fn schedule(problem: &Problem) -> Solution {
         let available_capacity = base_available.max(effective_sticky + 1000); // Always leave some room
 
         // Use enhanced retention with weight stationary priorities
-        let (tensors_to_retain, _sticky_retained) = enhance_retention_with_weights(
+        let tensors_to_retain = analyze_tensor_residency_with_liveness(
             &all_retention_candidates,
-            &weight_analysis,
             &remaining_ops,
             problem,
             &tensor_meta,
             available_capacity,
+            &liveness,
         );
 
         // Calculate subgraph latency

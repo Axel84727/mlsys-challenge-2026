@@ -1193,6 +1193,64 @@ pub fn find_best_tiling(
         return problem.native_granularity.clone();
     }
 
+    // EMERGENCY FIX: Check if native fits first - if it does, use it!
+    let native = &problem.native_granularity;
+    let ws_native = crate::memory::compute_subgraph_working_set(
+        ops, problem, native, tensor_meta
+    );
+
+    if ws_native.fits_in(problem.fast_memory_capacity) {
+        eprintln!("    [FAST PATH] Native granularity fits, using it directly");
+
+        // Only try Split-K if we have MatMul
+        let has_matmul = ops.iter().any(|&op_id| problem.ops[op_id].is_matmul());
+        if has_matmul {
+            // Try K=2 to see if it improves latency
+            let with_k2 = Granularity::new(native.width, native.height, 2);
+            let ws_k2 = crate::memory::compute_subgraph_working_set(
+                ops, problem, &with_k2, tensor_meta
+            );
+
+            if ws_k2.fits_in(problem.fast_memory_capacity) {
+                // Compare latencies (with snake traversal enabled)
+                let latency_native = compute_subgraph_latency(
+                    ops,
+                    problem,
+                    native,
+                    tensor_meta,
+                    memory_state,
+                    tensors_to_retain,
+                    true  // use_snake_traversal
+                );
+                let latency_k2 = compute_subgraph_latency(
+                    ops,
+                    problem,
+                    &with_k2,
+                    tensor_meta,
+                    memory_state,
+                    tensors_to_retain,
+                    true  // use_snake_traversal
+                );
+
+                if latency_k2 < latency_native * 0.95 {
+                    eprintln!("    [SPLIT-K] K=2 improves latency by {:.1}%",
+                              (1.0 - latency_k2/latency_native) * 100.0);
+                    return with_k2;
+                }
+            }
+        }
+
+        return native.clone();
+    }
+
+    // ... rest of existing function continues here ...
+
+    // PERF: Pre-compute fusion bonus ONCE (it doesn't depend on granularity!)
+    let fusion_bonus = precompute_fusion_bonus(ops, problem);
+
+    // Check if we have MatMul ops (need to consider Split-K)
+    let has_matmul = ops.iter().any(|&op_id| problem.ops[op_id].is_matmul());
+
     // PERF: Pre-compute fusion bonus ONCE (it doesn't depend on granularity!)
     let fusion_bonus = precompute_fusion_bonus(ops, problem);
 
