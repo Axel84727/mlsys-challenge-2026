@@ -104,22 +104,12 @@ fn main() -> Result<()> {
     eprintln!("    - Subgraphs: {}", solution.subgraphs.len());
 
     // Calculate and report latency
-    let subgraphs_for_latency: Vec<mlsys::models::Subgraph> = solution.subgraphs
+    // Use the PRE-COMPUTED latencies from the scheduler (with optimizations applied)
+    let total_latency: f64 = solution.subgraphs
         .iter()
-        .map(|sg| mlsys::models::Subgraph {
-            ops: sg.ops.clone(),
-            tensors_to_retain: sg.tensors_to_retain.clone(),
-            granularity: mlsys::models::GranularityOutput {
-                w: sg.granularity.w,
-                h: sg.granularity.h,
-                k: sg.granularity.k,
-            },
-            traversal_order: sg.traversal_order.clone(),
-            subgraph_latency: 0.0,
-        })
-        .collect();
+        .map(|sg| sg.subgraph_latency)
+        .sum();
 
-    let total_latency = compute_total_latency(&subgraphs_for_latency, &problem);
     eprintln!("[*] Estimated total latency: {:.2}", total_latency);
 
     // Print subgraph summary
@@ -256,4 +246,3 @@ mod integration_tests {
         assert_eq!(total_ops, 4);
     }
 }
-

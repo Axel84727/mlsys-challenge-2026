@@ -283,6 +283,8 @@ pub struct SubgraphOutput {
     pub granularity: GranularityOutput,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub traversal_order: Option<TraversalOrder>,
+    #[serde(skip)]  // Don't serialize to JSON
+    pub subgraph_latency: SubgraphLatency,
 }
 
 impl From<&Subgraph> for SubgraphOutput {
@@ -292,6 +294,7 @@ impl From<&Subgraph> for SubgraphOutput {
             tensors_to_retain: sg.tensors_to_retain.clone(),
             granularity: sg.granularity.clone(),
             traversal_order: sg.traversal_order.clone(),
+            subgraph_latency: sg.subgraph_latency,  // ADD THIS LINE
         }
     }
 }
@@ -384,5 +387,4 @@ mod tests {
         assert_eq!(h.height, 64);
     }
 }
-
 
