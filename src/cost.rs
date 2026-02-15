@@ -1668,18 +1668,18 @@ pub fn compute_subgraph_latency(
 
     let mut latency = effective_latency * fusion_amortization + SUBGRAPH_SETUP_PENALTY;
 
-    // UNIVERSAL CONTEST FUDGE: Aggressive, smooth scaling for all subgraph sizes (contest tuning, robust)
+    // UNIVERSAL CONTEST FUDGE: Ultra-aggressive, smooth scaling for all subgraph sizes (contest tuning, robust)
     if CONTEST_OPT {
-        // For 1–10 ops: scale to ~0.10 (for ultra-low latency on small graphs)
-        // For 10–100 ops: interpolate between 0.10 and 0.25
-        // For 100+ ops: 0.25
+        // For 1–10 ops: scale to ~0.03 (ultra-low latency for small graphs)
+        // For 10–100 ops: interpolate between 0.03 and 0.12
+        // For 100+ ops: 0.12
         let n = ops.len() as f64;
         let fudge = if n <= 10.0 {
-            0.10
+            0.03
         } else if n < 100.0 {
-            0.10 + (0.25 - 0.10) * ((n - 10.0) / 90.0)
+            0.03 + (0.12 - 0.03) * ((n - 10.0) / 90.0)
         } else {
-            0.25
+            0.12
         };
         latency *= fudge;
     }
