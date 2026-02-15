@@ -30,6 +30,7 @@
 //! For maximum robustness, use cost_model::analyze_graph_density() to detect
 //! workload characteristics and adapt the optimization strategy accordingly.
 
+use crate::partition::{calculate_optimal_partitioning, PartitionConfig};
 use crate::cost::{compute_subgraph_latency, generate_snake_traversal, MemoryState};
 use crate::cost_model::analyze_graph_density;
 use crate::layout::{
@@ -781,6 +782,97 @@ fn extreme_fusion(
             break;
         }
     }
+    topological_sort_ops(&fused_ops, state.problem, state.tensor_meta)
+}
+
+/// Bounded fusion - similar to extreme_fusion but stops at target_ops
+///
+/// This is used when the partition plan recommends multiple subgraphs.
+/// Instead of trying to fuse everything, we stop at a reasonable size.
+fn bounded_fusion(
+    seed_op: OpId,
+    state: &SchedulerState,
+    _granularity_hint: &Granularity,
+    target_ops: usize,  // ← New parameter: stop when we reach this many ops
+    critical_metrics: &CriticalPathMetrics,
+) -> Vec<OpId> {
+    let mut fused_ops: Vec<OpId> = vec![seed_op];
+    let mut fused_set: HashSet<OpId> = [seed_op].into_iter().collect();
+    let mut subgraph_outputs: HashSet<TensorId> = state.problem.ops[seed_op]
+        .outputs.iter().copied().collect();
+
+    let max_iterations = state.problem.ops.len() * 3;
+
+    for _iteration in 0..max_iterations {
+        // BOUNDED: Stop when we reach target
+        if fused_ops.len() >= target_ops {
+            break;
+        }
+
+        // === Global Ready Queue Scan ===
+        let eligible_candidates: Vec<OpId> = state.unscheduled
+            .iter()
+            .copied()
+            .filter(|&op_id| !fused_set.contains(&op_id))
+            .filter(|&op_id| can_add_to_fusion(op_id, &fused_set, state))
+            .collect();
+
+        if eligible_candidates.is_empty() {
+            break;
+        }
+
+        // Calculate priorities - use parallel only for large candidate sets
+        let mut candidates: Vec<(OpId, i64)> = if eligible_candidates.len() >= PARALLEL_PRIORITY_THRESHOLD {
+            eligible_candidates
+                .par_iter()
+                .map(|&op_id| {
+                    let priority = state.calculate_fusion_priority_with_critical_path(
+                        op_id, &fused_set, &subgraph_outputs, critical_metrics);
+                    (op_id, priority)
+                })
+                .collect()
+        } else {
+            eligible_candidates
+                .iter()
+                .map(|&op_id| {
+                    let priority = state.calculate_fusion_priority_with_critical_path(
+                        op_id, &fused_set, &subgraph_outputs, critical_metrics);
+                    (op_id, priority)
+                })
+                .collect()
+        };
+
+        candidates.sort_by(|a, b| b.1.cmp(&a.1));
+
+        let mut added_any = false;
+
+        for (candidate, priority) in candidates {
+            if fused_ops.len() >= target_ops {
+                break;
+            }
+
+            let mut test_ops: Vec<OpId> = fused_ops.clone();
+            test_ops.push(candidate);
+
+            let fits = try_fit_in_memory(&test_ops, state.problem, state.tensor_meta);
+
+            if fits {
+                fused_ops.push(candidate);
+                fused_set.insert(candidate);
+                for &out_id in &state.problem.ops[candidate].outputs {
+                    subgraph_outputs.insert(out_id);
+                }
+                added_any = true;
+                if priority >= MATMUL_POINTWISE_FUSION_BONUS {
+                    break;
+                }
+            }
+        }
+        if !added_any {
+            break;
+        }
+    }
+
     topological_sort_ops(&fused_ops, state.problem, state.tensor_meta)
 }
 
@@ -1572,6 +1664,7 @@ fn absorb_trailing_orphans(
 pub fn schedule(problem: &Problem) -> Solution {
     let tensor_meta = problem.build_tensor_meta();
 
+
     // === NEW: Graph Density Analysis ===
     use crate::cost_model::analyze_graph_density;
     let density_analysis = analyze_graph_density(problem);
@@ -1653,6 +1746,33 @@ pub fn schedule(problem: &Problem) -> Solution {
         }
     }
 
+    // === Phase 1.5: Weight Stationary Analysis ===
+    // ... existing code ...
+
+    // === PHASE 1.6: INTELLIGENT PARTITIONING ===
+    // Calculate optimal number of subgraphs BEFORE starting the main loop
+    // This prevents the "one-subgraph trap" where we try to cram everything
+    // into a single subgraph, causing catastrophic thrashing.
+
+    use crate::partition::{calculate_optimal_partitioning, PartitionConfig};
+
+    let partition_config = PartitionConfig::from_density(density_analysis.density);
+    let partition_plan = calculate_optimal_partitioning(problem, &tensor_meta, &partition_config);
+
+    eprintln!("[*] Partition Planning:");
+    eprintln!("    - Recommended subgraphs: {}", partition_plan.num_subgraphs);
+    eprintln!("    - Ops per subgraph: ~{}", partition_plan.ops_per_subgraph);
+    eprintln!("    - Effective SRAM: {}KB ({}% of {}KB)",
+              partition_plan.effective_capacity / 1024,
+              (partition_plan.effective_capacity * 100) / problem.fast_memory_capacity,
+              problem.fast_memory_capacity / 1024
+    );
+    eprintln!("    - Rationale: {}", partition_plan.rationale);
+    eprintln!("    - Can use full fusion: {}", partition_plan.can_use_full_fusion);
+
+    // Create scheduler state with liveness info
+    let mut state = SchedulerState::new(problem, &tensor_meta, &liveness, &sram_reservation);
+
     // Main scheduling loop
     while !state.unscheduled.is_empty() {
         // Get all ready ops
@@ -1672,31 +1792,64 @@ pub fn schedule(problem: &Problem) -> Solution {
         // because more tensors become intermediate/ephemeral.
         let seed_op = select_best_seed(&ready_ops, &state);
 
-        // Try full fusion first
-        let (fused_ops, granularity) = try_full_fusion_first(&state, &ready_ops, problem, &tensor_meta, use_aggressive_fusion)
-            .map(|(ops, gran)| {
-                // Full fusion succeeded - use the granularity it found
-                eprintln!("    [USING] Granularity from full fusion: {}x{}x{}",
-                          gran.width, gran.height, gran.depth);
-                (ops, gran)
-            })
-            .unwrap_or_else(|| {
-                // Fall back to incremental fusion
-                let ops = extreme_fusion(
-                    seed_op,
-                    &state,
-                    &problem.native_granularity,
-                    sram_config.max_ops_per_subgraph,
-                    &critical_metrics,
-                );
+        // === INTELLIGENT FUSION STRATEGY ===
+        // Decide between full fusion vs bounded fusion based on partition plan
 
-                // Select granularity for incremental fusion
-                let gran = select_granularity_with_dynamic_split_k(
-                    &ops, problem, &tensor_meta, &sram_reservation,
-                );
+        let should_try_full_fusion = partition_plan.can_use_full_fusion
+            && partition_plan.num_subgraphs == 1
+            && use_aggressive_fusion;
 
-                (ops, gran)
-            });
+        let (fused_ops, granularity) = if should_try_full_fusion {
+            // Plan says we can safely do full fusion
+            eprintln!("    [FULL FUSION] Attempting to fuse all {} remaining ops", state.unscheduled.len());
+
+            try_full_fusion_first(&state, &ready_ops, problem, &tensor_meta, true)
+                .map(|(ops, gran)| {
+                    eprintln!("    [SUCCESS] Full fusion succeeded with {}x{}x{}",
+                              gran.width, gran.height, gran.depth);
+                    (ops, gran)
+                })
+                .unwrap_or_else(|| {
+                    // Plan said full fusion was safe, but it didn't fit - fall back
+                    eprintln!("    [FALLBACK] Full fusion failed, using incremental");
+                    let ops = extreme_fusion(
+                        seed_op,
+                        &state,
+                        &problem.native_granularity,
+                        sram_config.max_ops_per_subgraph,
+                        &critical_metrics,
+                    );
+                    let gran = select_granularity_with_dynamic_split_k(
+                        &ops, problem, &tensor_meta, &sram_reservation,
+                    );
+                    (ops, gran)
+                })
+        } else {
+            // Partition plan says we need multiple subgraphs
+            // Use bounded fusion to create subgraphs of the recommended size
+            eprintln!("    [PARTITIONED] Creating subgraph {}/~{} (target: {} ops)",
+                      subgraphs.len() + 1,
+                      partition_plan.num_subgraphs,
+                      partition_plan.ops_per_subgraph
+            );
+
+            let target_ops = partition_plan.ops_per_subgraph;
+            let ops = bounded_fusion(
+                seed_op,
+                &state,
+                &problem.native_granularity,
+                target_ops,
+                &critical_metrics,
+            );
+
+            eprintln!("    [BOUNDED] Fused {} ops (target was {})", ops.len(), target_ops);
+
+            let gran = select_granularity_with_dynamic_split_k(
+                &ops, problem, &tensor_meta, &sram_reservation,
+            );
+
+            (ops, gran)
+        };
 
         // === Phase 2: Aggressive Kernel Fusion (MatMul + Pointwise) ===
         // ... rest of code continues as before ...
@@ -1994,10 +2147,20 @@ pub fn schedule(problem: &Problem) -> Solution {
 
     // === POST-SCHEDULE OPTIMIZATION ===
     // Pass 1: Recursive pairwise merging
-    let merged_subgraphs = recursive_merge_subgraphs(subgraphs, problem, &tensor_meta);
-
-    // Pass 2: Absorb trailing orphans
-    let final_subgraphs = absorb_trailing_orphans(merged_subgraphs, problem, &tensor_meta);
+    // === POST-SCHEDULE OPTIMIZATION ===
+    // CRITICAL: Only merge subgraphs if the partition plan said we could use full fusion
+    // Otherwise, we'll undo all the careful partitioning we just did!
+    let final_subgraphs = if partition_plan.can_use_full_fusion {
+        eprintln!("[*] POST-SCHEDULE: Applying merge optimizations (full fusion was safe)");
+        // Pass 1: Recursive pairwise merging
+        let merged = recursive_merge_subgraphs(subgraphs, problem, &tensor_meta);
+        // Pass 2: Absorb trailing orphans
+        absorb_trailing_orphans(merged, problem, &tensor_meta)
+    } else {
+        eprintln!("[*] POST-SCHEDULE: Skipping merge optimizations (respecting {} subgraph partition)",
+                  partition_plan.num_subgraphs);
+        subgraphs
+    };
 
     // Recalculate latencies for final subgraphs
     let mut final_memory_state = MemoryState::new();
