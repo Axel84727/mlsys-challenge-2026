@@ -493,7 +493,7 @@ pub fn analyze_tensor_residency(
 
 /// Find ops that can be immediately scheduled next (all their inputs are available).
 #[allow(dead_code)]
-fn find_immediate_consumers(
+pub fn find_immediate_consumers(
     available_tensors: &[TensorId],
     remaining_ops: &HashSet<OpId>,
     problem: &Problem,
@@ -539,6 +539,99 @@ pub fn compute_available_retention_capacity(
     let available = problem.fast_memory_capacity - ws.total_size - margin;
 
     available.max(0)
+}
+
+/// Compute sticky tensors that should be retained in fast memory.
+///
+/// Strategy:
+/// 1. Retain tensors that are graph outputs (must keep)
+/// 2. Prioritize tensors needed by immediate consumers (ready to execute)
+/// 3. Fill available capacity with high-priority tensors
+pub fn compute_sticky_tensors(
+    ops: &[OpId],
+    problem: &Problem,
+    tensor_meta: &[TensorMeta],
+    available_capacity: FastMemoryCapacity,
+) -> Vec<TensorId> {
+    // Collect outputs from this subgraph
+    let mut subgraph_outputs: HashSet<TensorId> = HashSet::new();
+    for &op_id in ops {
+        subgraph_outputs.extend(problem.ops[op_id].outputs.iter().copied());
+    }
+
+    // Identify tensors that are graph outputs (must keep)
+    let mut must_retain: Vec<TensorId> = tensor_meta.iter()
+        .enumerate()
+        .filter(|(_, meta)| meta.is_output)
+        .map(|(id, _)| id)
+        .collect();
+
+    // === NEW: Find immediate consumers ===
+    let remaining_ops: HashSet<OpId> = (0..problem.ops.len())
+        .filter(|op_id| !ops.contains(op_id))
+        .collect();
+
+    let outputs_vec: Vec<TensorId> = subgraph_outputs.iter().copied().collect();
+    let immediate_consumers = find_immediate_consumers(
+        &outputs_vec,
+        &remaining_ops,
+        problem,
+        tensor_meta
+    );
+
+    if !immediate_consumers.is_empty() {
+        eprintln!("    [Immediate Consumers] Found {} ops ready to execute next",
+            immediate_consumers.len());
+    }
+
+    // Prioritize tensors needed by immediate consumers
+    let mut high_priority: Vec<(TensorId, i64)> = Vec::new();
+
+    for &tensor_id in &outputs_vec {
+        let meta = &tensor_meta[tensor_id];
+
+        // Check if any immediate consumer needs this tensor
+        let is_immediate = meta.consumers.iter()
+            .any(|&consumer| immediate_consumers.contains(&consumer));
+
+        if is_immediate {
+            let size = problem.tensors[tensor_id].size();
+            let priority = if meta.consumers.len() > 1 {
+                // Multiple immediate consumers = very high priority
+                size * 1000
+            } else {
+                // Single immediate consumer = high priority
+                size * 100
+            };
+            high_priority.push((tensor_id, priority));
+        }
+    }
+
+    // Sort by priority (descending)
+    high_priority.sort_by(|a, b| b.1.cmp(&a.1));
+
+    // Pack tensors into available capacity
+    let mut used_capacity = 0i64;
+    let mut sticky = must_retain.clone();
+
+    for (tensor_id, _priority) in high_priority {
+        if must_retain.contains(&tensor_id) {
+            continue; // Already included
+        }
+
+        let size = problem.tensors[tensor_id].size();
+        if used_capacity + size <= available_capacity {
+            sticky.push(tensor_id);
+            used_capacity += size;
+        }
+    }
+
+    if !sticky.is_empty() {
+        eprintln!("    [Sticky Tensors] Retaining {} tensors ({} bytes) for immediate use",
+            sticky.len(), used_capacity);
+    }
+
+    sticky
 }
 
 #[cfg(test)]
