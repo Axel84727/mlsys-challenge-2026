@@ -19,6 +19,10 @@ rayon = "1.10"
 log = "0.4"
 env_logger = "0.11"
 bumpalo = "3.16"  # Bump allocator for O(1) allocation
+nix = { version = "0.29", features = ["process", "signal", "mman"] }  # fork/waitpid/signals
+shared_memory = "0.12"  # Cross-process shared memory segments
+bit-set = "0.8"  # Efficient bitset for liveness analysis
+bit-vec = "0.8"  # Backing storage for bit-set
 
 [profile.release]
 opt-level = 3

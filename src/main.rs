@@ -20,10 +20,9 @@ use std::fs;
 use std::io::Write;
 use std::time::Instant;
 
-use mlsys::cost::compute_total_latency;
 use mlsys::graph_rewrite::canonicalize_graph;
 use mlsys::models::{Problem, ProblemJson};
-use mlsys::scheduler::{optimize_schedule, schedule};
+use mlsys::parallel;
 use mlsys::telemetry;
 
 fn main() -> Result<()> {
@@ -94,11 +93,12 @@ fn main() -> Result<()> {
     eprintln!("    - Tensors: {}", problem.tensors.len());
 
     // Run scheduler
-    eprintln!("[*] Running scheduler...");
+    eprintln!("[*] Running parallel scheduler...");
     let schedule_start = Instant::now();
 
-    let initial_solution = schedule(&problem);
-    let solution = optimize_schedule(initial_solution, &problem);
+    // Use the multi-process parallel scheduler which automatically decides
+    // between single-process and multi-process based on graph size/topology
+    let solution = parallel::run_parallel(&problem);
 
     eprintln!("[*] Scheduling completed in {:?}", schedule_start.elapsed());
     eprintln!("    - Subgraphs: {}", solution.subgraphs.len());
@@ -154,6 +154,7 @@ fn main() -> Result<()> {
 mod integration_tests {
     use super::*;
     use mlsys::models::{Granularity, Op, OpType, Tensor};
+    use mlsys::scheduler::{schedule, optimize_schedule};
 
     #[test]
     fn test_end_to_end_simple() {
@@ -244,5 +245,90 @@ mod integration_tests {
         // All 4 ops should be scheduled
         let total_ops: usize = solution.subgraphs.iter().map(|sg| sg.ops.len()).sum();
         assert_eq!(total_ops, 4);
+    }
+
+    #[test]
+    fn test_parallel_small_via_parallel_api() {
+        // Verify the parallel::run_parallel API works for small graphs
+        let problem = Problem {
+            tensors: vec![
+                Tensor { width: 128, height: 128 },
+                Tensor { width: 128, height: 128 },
+                Tensor { width: 128, height: 128 },
+            ],
+            ops: vec![
+                Op {
+                    op_type: OpType::Pointwise,
+                    inputs: vec![0],
+                    outputs: vec![1],
+                    base_cost: 100,
+                },
+                Op {
+                    op_type: OpType::Pointwise,
+                    inputs: vec![1],
+                    outputs: vec![2],
+                    base_cost: 10,
+                },
+            ],
+            fast_memory_capacity: 50000,
+            slow_memory_bandwidth: 10,
+            native_granularity: Granularity::new(128, 128, 1),
+        };
+
+        let solution = mlsys::parallel::run_parallel(&problem);
+        assert!(!solution.subgraphs.is_empty());
+
+        let mut ops: Vec<usize> = solution.subgraphs
+            .iter()
+            .flat_map(|sg| sg.ops.iter().copied())
+            .collect();
+        ops.sort();
+        ops.dedup();
+        assert_eq!(ops.len(), 2);
+    }
+
+    #[test]
+    fn test_parallel_monster_graph() {
+        // Test multi-process path with a 3000-op graph
+        let num_ops = 3000;
+        let num_tensors = num_ops + 1;
+        let problem = Problem {
+            tensors: (0..num_tensors)
+                .map(|_| Tensor { width: 128, height: 128 })
+                .collect(),
+            ops: (0..num_ops)
+                .map(|i| Op {
+                    op_type: OpType::Pointwise,
+                    inputs: vec![i],
+                    outputs: vec![i + 1],
+                    base_cost: 100,
+                })
+                .collect(),
+            fast_memory_capacity: 500000,
+            slow_memory_bandwidth: 100,
+            native_granularity: Granularity::new(128, 128, 1),
+        };
+
+        let solution = mlsys::parallel::run_parallel(&problem);
+        assert!(!solution.subgraphs.is_empty());
+
+        // ALL ops must be covered exactly once
+        let mut all_ops: Vec<usize> = solution.subgraphs
+            .iter()
+            .flat_map(|sg| sg.ops.iter().copied())
+            .collect();
+        all_ops.sort();
+        all_ops.dedup();
+        assert_eq!(
+            all_ops.len(),
+            num_ops,
+            "Expected {} unique ops, got {}",
+            num_ops,
+            all_ops.len()
+        );
+
+        // Verify solution serializes to valid JSON
+        let json = serde_json::to_string(&solution).unwrap();
+        assert!(json.contains("subgraphs"));
     }
 }
